@@ -1,4 +1,4 @@
-module github.com/byJoey/dun
+module github.com/CapSOSkw/dun
 
 go 1.26.0
 

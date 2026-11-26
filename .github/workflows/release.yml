@@ -16,10 +16,11 @@ jobs:
       - name: build
         run: |
           v=${GITHUB_REF_NAME#v}
+          # 版本号和仓库名都在编译时注入，fork 出去的仓库 dun upgrade 也会认自己的 Release
           for a in amd64 arm64; do
-            CGO_ENABLED=0 GOOS=linux GOARCH=$a go build -trimpath -ldflags "-s -w -X main.version=$v" -o dist/dun-linux-$a .
+            CGO_ENABLED=0 GOOS=linux GOARCH=$a go build -trimpath -ldflags "-s -w -X main.version=$v -X main.repo=$GITHUB_REPOSITORY" -o dist/dun-linux-$a .
           done
-          cp install.sh dist/
+          sed "s#github.com/[^/]*/dun/releases#github.com/$GITHUB_REPOSITORY/releases#" install.sh > dist/install.sh
           (cd dist && sha256sum * > sha256sums.txt)
       - name: publish
         env:

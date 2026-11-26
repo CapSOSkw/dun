@@ -23,8 +23,10 @@ const (
 	svcBox      = "dun-sb"
 	svcWeb      = "dun"
 	rulePrefix  = "dun ws "
-	repo        = "byJoey/dun"
 )
+
+// dun upgrade 从这个仓库的 Release 拉新版本；发版时 workflow 会用 -X main.repo 注入当前仓库
+var repo = "CapSOSkw/dun"
 
 type DNSRecord struct {
 	Type    string `json:"type"`

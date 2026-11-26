@@ -4,6 +4,8 @@
 
 dun 是一个 Go 写的单文件程序。节点由官方 sing-box 跑，伪装站、订阅和证书续期由 dun 自己的后台服务负责。
 
+> 本仓库 fork 自 [byJoey/dun](https://github.com/byJoey/dun)。
+
 ## 快速开始
 
 准备三样东西：
@@ -15,7 +17,7 @@ dun 是一个 Go 写的单文件程序。节点由官方 sing-box 跑，伪装�
 登录 VPS，执行：
 
 ```bash
-bash <(curl -fsSL https://github.com/byJoey/dun/releases/latest/download/install.sh)
+bash <(curl -fsSL https://github.com/CapSOSkw/dun/releases/latest/download/install.sh)
 ```
 
 菜单里选 `4` 三个一起装。中间会问 CF 邮箱和 Key，让你选一个域名，其他问题一路回车用默认值就行。装完屏幕上会打出订阅地址，复制进客户端就能用。
@@ -180,4 +182,4 @@ sing-box 官方客户端、Clash Verge Rev、FlClash 这类 mihomo 内核的客�
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w -X main.version=dev" -o dun .
 ```
 
-打 `v*` 的 tag 推上去，GitHub Actions 会自动编译 amd64、arm64 两个版本并发布 Release。
+打 `v*` 的 tag 推上去，GitHub Actions 会自动编译 amd64、arm64 两个版本并发布 Release。仓库名会在编译时注入，`dun upgrade` 和 install.sh 都从发版的这个仓库拉，fork 出去的仓库不会跑回上游。fork 的仓库第一次用，要先在 Actions 页面启用 workflow。
