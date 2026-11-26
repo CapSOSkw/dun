@@ -100,7 +100,7 @@ func cfPickZone(st *State, c *CF) {
 	if i < 0 {
 		die("已取消")
 	}
-	st.Zone = &Zone{ID: zs[i].ID, Name: zs[i].Name, NS: zs[i].NS}
+	st.Zone = &Zone{ID: zs[i].ID, Name: zs[i].Name, NS: zs[i].NS, Account: zs[i].Account.ID}
 	st.save()
 	ok("域名: %s", st.Zone.Name)
 }
@@ -121,7 +121,8 @@ func cfPickHostUnder(st *State, c *CF, hint, parent string) (string, []DNSRecord
 			continue
 		}
 		host := l + "." + parent
-		if (st.TLS != nil && st.TLS.Host == host) || (st.WS != nil && st.WS.Host == host) {
+		if (st.TLS != nil && st.TLS.Host == host) || (st.WS != nil && st.WS.Host == host) ||
+			(st.Argo != nil && st.Argo.Host == host) {
 			warn("%s 已经被本脚本用了", host)
 			continue
 		}
@@ -132,11 +133,16 @@ func cfPickHostUnder(st *State, c *CF, hint, parent string) (string, []DNSRecord
 		var bk []DNSRecord
 		if len(rs) > 0 {
 			var desc []string
+			tunnel := false
 			for _, r := range rs {
 				desc = append(desc, r.Type+" "+r.Content)
 				bk = append(bk, r.DNSRecord)
+				tunnel = tunnel || (r.Type == "CNAME" && strings.HasSuffix(strings.ToLower(r.Content), ".cfargotunnel.com"))
 			}
 			warn("%s 已有 %d 条解析：%s", host, len(rs), strings.Join(desc, ", "))
+			if tunnel {
+				warn("它正被一条 CF 隧道使用，覆盖后那条隧道上这个域名的节点会断，卸载 dun 时才会恢复。建议换个名字")
+			}
 			if !confirm("覆盖它？卸载时会还原", false) {
 				continue
 			}
@@ -145,12 +151,17 @@ func cfPickHostUnder(st *State, c *CF, hint, parent string) (string, []DNSRecord
 	}
 }
 
-func dnsSet(st *State, c *CF, host string, proxied bool) string {
+// 删掉这个名字下的所有解析；原有的在选子域名时已经备份过
+func dnsClear(st *State, c *CF, host string) {
 	if rs, err := c.DNSList(st.Zone.ID, host); err == nil {
 		for _, r := range rs {
 			c.DNSDelete(st.Zone.ID, r.ID)
 		}
 	}
+}
+
+func dnsSet(st *State, c *CF, host string, proxied bool) string {
+	dnsClear(st, c, host)
 	rec := DNSRecord{Type: "A", Name: host, Content: st.IP4, Proxied: proxied, TTL: 1, Comment: "dun"}
 	if st.IP4 == "" {
 		rec.Type, rec.Content = "AAAA", st.IP6
@@ -271,7 +282,7 @@ func tlsHostRelease(st *State) {
 }
 
 func zoneRelease(st *State) {
-	if st.TLS == nil && st.WS == nil {
+	if st.TLS == nil && st.WS == nil && st.Argo == nil {
 		st.Zone = nil
 		st.save()
 	}
@@ -396,7 +407,9 @@ func removeWS(st *State) {
 	}
 	st.WS = nil
 	applyAll(st)
-	os.Remove(wetestPath)
+	if st.Argo == nil { // Argo 也用这份优选缓存
+		os.Remove(wetestPath)
+	}
 	zoneRelease(st)
 	ok("CF WS 已卸载")
 }

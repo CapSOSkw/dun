@@ -150,6 +150,26 @@ func siteHandler(st *State, ws bool) http.Handler {
 	})
 }
 
+// Argo 域名上的请求由 cloudflared 转到这里：伪装站和订阅；XHTTP 的路径再转给 Xray。
+// 正常情况下隧道路由会把 XHTTP 直接送到 Xray，手动在 CF 后台建的隧道只有一条路由，全到这里
+func argoHandler(st *State) http.Handler {
+	site := siteHandler(st, false)
+	t, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", st.Argo.Inner))
+	xh := &httputil.ReverseProxy{
+		Rewrite:       func(r *httputil.ProxyRequest) { r.SetURL(t); r.Out.Host = r.In.Host },
+		FlushInterval: -1,
+		ErrorLog:      quietLog,
+	}
+	p := st.Argo.Path
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == p || strings.HasPrefix(r.URL.Path, p+"/") {
+			xh.ServeHTTP(w, r)
+			return
+		}
+		site.ServeHTTP(w, r)
+	})
+}
+
 // 每次请求现读状态，改了优选设置不用重启
 func serveSub(w http.ResponseWriter, clash bool) {
 	st := loadState()
@@ -206,11 +226,21 @@ func serve() {
 			log.Fatalf("WS 端口监听失败: %v", err)
 		}
 		go func() { errs <- srv.Serve(ln) }()
+	}
+	if st.Argo != nil {
+		srv := &http.Server{Handler: argoHandler(st), ReadHeaderTimeout: 15 * time.Second, ErrorLog: quietLog}
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", st.Argo.Web))
+		if err != nil {
+			log.Fatalf("Argo 伪装站监听失败: %v", err)
+		}
+		go func() { errs <- srv.Serve(ln) }()
+	}
+	if st.WS != nil || st.Argo != nil {
 		go wetestLoop()
 	}
 	go renewLoop()
 	log.Printf("dun %s 已启动", version)
-	if st.Reality == nil && st.WS == nil {
+	if st.Reality == nil && st.WS == nil && st.Argo == nil {
 		select {}
 	}
 	log.Fatal(<-errs)

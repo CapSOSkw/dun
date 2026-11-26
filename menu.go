@@ -12,7 +12,8 @@ import (
 )
 
 func protoLabel(k string) string {
-	return map[string]string{"reality": "Reality 偷自己", "anytls": "AnyTLS", "ws": "CF WS", "hy2": "Hysteria2"}[k]
+	return map[string]string{"reality": "Reality 偷自己", "anytls": "AnyTLS", "ws": "CF WS", "hy2": "Hysteria2",
+		"argo": "Argo 隧道"}[k]
 }
 
 func pickProto(st *State) string {
@@ -28,6 +29,9 @@ func pickProto(st *State) string {
 	}
 	if st.Hy2 != nil {
 		ks = append(ks, "hy2")
+	}
+	if st.Argo != nil {
+		ks = append(ks, "argo")
 	}
 	if len(ks) == 0 {
 		warn("还没装任何协议")
@@ -49,7 +53,7 @@ func showLinks(st *State) {
 		warn("还没装任何协议")
 		return
 	}
-	if st.WS != nil && len(loadWetest().Items) == 0 && !st.CFIP.NoWetest {
+	if (st.WS != nil || st.Argo != nil) && len(loadWetest().Items) == 0 && !st.CFIP.NoWetest {
 		refreshWetest(st)
 	}
 	var b strings.Builder
@@ -69,6 +73,23 @@ func showLinks(st *State) {
 		l := linkAnyTLS(st, base+"-AnyTLS")
 		b.WriteString("【AnyTLS】直连，客户端要支持 AnyTLS\n" + l + "\n\n")
 		qrs = append(qrs, l)
+	}
+	if st.Argo != nil {
+		a := CFAddr{Addr: st.Argo.Host, Port: 443, Name: base + "-Argo"}
+		l := linkArgo(st, a, false)
+		b.WriteString("【Argo 隧道】VLESS + XHTTP，VPS 不开端口，IP 被墙也能用\n" + l + "\n")
+		qrs = append(qrs, l)
+		n := len(cfAddrs(st))
+		if !st.CFIP.NoH3 {
+			a.Name += "-UDP"
+			lu := linkArgo(st, a, true)
+			b.WriteString(lu + "\n")
+			b.WriteString("上面两个一个走 TCP（h2）、一个走 UDP（h3），晚高峰 UDP 往往更稳，UDP 被限速时用 TCP\n")
+			qrs = append(qrs, lu)
+			n *= 2
+		}
+		b.WriteString(fmt.Sprintf("订阅里另外带了 %d 个优选地址的 Argo 节点\n", n))
+		b.WriteString("要 v2rayN、Shadowrocket 2.2.66 以上（UDP 版要 2.2.78 以上）或新版 mihomo 客户端；NekoBox 这类 sing-box 内核的用不了\n\n")
 	}
 	if st.WS != nil {
 		l := linkWS(st, CFAddr{Addr: st.WS.Host, Port: 443, Name: base + "-CF-WS"})
@@ -121,6 +142,10 @@ func changePort(st *State) {
 	if k == "" {
 		return
 	}
+	if k == "argo" {
+		warn("Argo 隧道不占公网端口，没有要改的")
+		return
+	}
 	var port int
 	if k == "hy2" {
 		port = askUDPPort(st, curPort(st, k))
@@ -170,6 +195,12 @@ func resetSecret(st *State) {
 		fresh := newHy2(st.Hy2.Port, st.Hy2.PubPort)
 		fresh.HopStart, fresh.HopEnd = st.Hy2.HopStart, st.Hy2.HopEnd
 		st.Hy2 = fresh
+	case "argo":
+		st.Argo.UUID, st.Argo.Path = newUUID(), "/"+randLabel(10)
+		// 隧道路由按路径把 XHTTP 分给 Xray，路径换了要同步；同步不上也能用，会经 dun 转一手
+		if err := argoSyncIngress(st, cfLogin()); err != nil {
+			warn("隧道路由没同步上：%v。节点照样能用，只是多经过 dun 转一次", err)
+		}
 	}
 	applyAll(st)
 	ok("%s 的凭据已重置，旧链接作废", protoLabel(k))
@@ -182,7 +213,7 @@ func removeOne(st *State) {
 		return
 	}
 	map[string]func(*State){"reality": removeReality, "anytls": removeAnyTLS, "ws": removeWS,
-		"hy2": removeHy2}[k](st)
+		"hy2": removeHy2, "argo": removeArgo}[k](st)
 }
 
 func serviceMenu() {
@@ -206,8 +237,8 @@ func serviceMenu() {
 }
 
 func disguiseMenu(st *State) {
-	if st.Reality == nil && st.WS == nil {
-		warn("伪装站是给 Reality 和 CF WS 用的，先装其中一个")
+	if st.Reality == nil && st.WS == nil && st.Argo == nil {
+		warn("伪装站是给 Reality、CF WS 和 Argo 用的，先装其中一个")
 		return
 	}
 	cur := "伪装登录页"
@@ -265,8 +296,8 @@ func disguiseMenu(st *State) {
 }
 
 func cfipMenu(st *State) {
-	if st.WS == nil {
-		warn("优选地址是给 CF WS 用的，先装 CF WS")
+	if st.WS == nil && st.Argo == nil {
+		warn("优选地址是给 CF WS 和 Argo 用的，先装其中一个")
 		return
 	}
 	for {
@@ -288,9 +319,22 @@ func cfipMenu(st *State) {
 		}
 		fmt.Fprintf(os.Stderr, "  内置优选域名：%s，%d/%d 个能用   IPv6 优选：%s   自选：%d 个\n",
 			onoff(!st.CFIP.NoDomains), nd, len(builtinDomains), onoff(st.CFIP.V6), len(customAddrs()))
-		fmt.Fprintf(os.Stderr, "  订阅里一共 %d 个 CF WS 节点，每 3 小时自动刷新\n", len(cfAddrs(st))+1)
+		n := len(cfAddrs(st)) + 1
+		var parts []string
+		if st.WS != nil {
+			parts = append(parts, fmt.Sprintf("CF WS %d 个", n))
+		}
+		if st.Argo != nil {
+			m := n
+			if !st.CFIP.NoH3 {
+				m *= 2
+			}
+			parts = append(parts, fmt.Sprintf("Argo %d 个（UDP 版：%s）", m, onoff(!st.CFIP.NoH3)))
+		}
+		fmt.Fprintf(os.Stderr, "  订阅里的节点：%s，每 3 小时自动刷新\n", strings.Join(parts, "，"))
 		i := choose([]string{"立即刷新", "查看全部优选地址", "添加自选地址", "清空自选地址",
-			"开关 wetest 优选 IP", "开关 内置优选域名", "开关 IPv6 优选 IP", "重置订阅地址（旧订阅失效）"}, 1)
+			"开关 wetest 优选 IP", "开关 内置优选域名", "开关 IPv6 优选 IP",
+			"开关 Argo 的 UDP（h3）版节点", "重置订阅地址（旧订阅失效）"}, 1)
 		switch i {
 		case -1:
 			return
@@ -341,6 +385,9 @@ func cfipMenu(st *State) {
 			st.save()
 			refreshWetest(st)
 		case 7:
+			st.CFIP.NoH3 = !st.CFIP.NoH3
+			st.save()
+		case 8:
 			st.Token = randLabel(16)
 			applyAll(st)
 			ok("新订阅地址：%s/sub", subBase(st))
@@ -369,8 +416,8 @@ func syncIP(st *State) {
 }
 
 func changeCF(st *State) {
-	if st.TLS != nil || st.WS != nil {
-		warn("已装协议的解析在旧账号里，换账号只影响以后的操作；卸载前记得换回来")
+	if st.TLS != nil || st.WS != nil || st.Argo != nil {
+		warn("已装协议的解析（还有 Argo 隧道）在旧账号里，换账号只影响以后的操作；卸载前记得换回来")
 		if !confirm("继续？", false) {
 			return
 		}
@@ -378,19 +425,29 @@ func changeCF(st *State) {
 	os.Remove(cfPath)
 	cfCur = nil
 	cfLogin()
-	if st.TLS == nil && st.WS == nil {
+	if st.TLS == nil && st.WS == nil && st.Argo == nil {
 		st.Zone = nil
 		st.save()
 	}
 }
 
 func updateCore(st *State) {
+	updateSingBox(st)
+	if st.Argo != nil {
+		updateXray()
+		if !st.Argo.External {
+			updateCfd()
+		}
+	}
+}
+
+func updateSingBox(st *State) {
 	cur, latest := sbVersion(), ghLatest("SagerNet/sing-box")
 	if latest == "" {
-		warn("拿不到最新版本号")
+		warn("拿不到 sing-box 最新版本号")
 		return
 	}
-	if cur == latest && !confirm("已经是最新 "+cur+"，还要重装？", false) {
+	if cur == latest && !confirm("sing-box 已经是最新 "+cur+"，还要重装？", false) {
 		return
 	}
 	sbInstall(latest)
@@ -437,11 +494,14 @@ func updateSelf() {
 }
 
 func uninstallAll(st *State) {
-	if !confirm("卸载全部协议，删掉解析、CF 规则、证书和 sing-box？", false) {
+	if !confirm("卸载全部协议，删掉解析、CF 规则、隧道、证书和内核？", false) {
 		return
 	}
-	if (st.TLS != nil || st.WS != nil) && cfLoad() == nil {
-		warn("没有 CF 凭据，CF 上的解析和规则要自己删")
+	if (st.TLS != nil || st.WS != nil || st.Argo != nil) && cfLoad() == nil {
+		warn("没有 CF 凭据，CF 上的解析、规则和隧道要自己删")
+	}
+	if st.Argo != nil {
+		removeArgo(st)
 	}
 	if st.Hy2 != nil {
 		removeHy2(st)
@@ -455,7 +515,7 @@ func uninstallAll(st *State) {
 	if st.Reality != nil {
 		removeReality(st)
 	}
-	for _, s := range []string{svcBox, svcWeb} {
+	for _, s := range []string{svcBox, svcWeb, svcXray, svcArgo} {
 		svcDisable(s)
 		os.Remove("/etc/systemd/system/" + s + ".service")
 		os.Remove("/etc/init.d/" + s)
@@ -484,6 +544,11 @@ func statusLine(st *State) {
 		return "未装"
 	}
 	fmt.Printf("  sing-box %s %s   dun 服务 %s\n", sbVersion(), run(svcBox), run(svcWeb))
+	if a := st.Argo; a != nil && a.External {
+		fmt.Printf("  Xray %s %s   隧道：复用 %s\n", xrayVersion(), run(svcXray), a.tunnelLabel())
+	} else if a != nil {
+		fmt.Printf("  Xray %s %s   cloudflared %s %s\n", xrayVersion(), run(svcXray), cfdVersion(), run(svcArgo))
+	}
 	r, a, w := "", "", ""
 	if st.Reality != nil {
 		r = fmt.Sprintf("端口 %d", st.Reality.Port)
@@ -502,11 +567,15 @@ func statusLine(st *State) {
 			h += fmt.Sprintf("（跳跃 %d-%d）", st.Hy2.HopStart, st.Hy2.HopEnd)
 		}
 	}
-	fmt.Printf("  Hysteria2: %s\n", p(st.Hy2 != nil, h))
+	g := ""
+	if st.Argo != nil {
+		g = st.Argo.Host
+	}
+	fmt.Printf("  Hysteria2: %s   Argo 隧道: %s\n", p(st.Hy2 != nil, h), p(st.Argo != nil, g))
 	if st.TLS != nil {
 		fmt.Printf("  节点域名: %s\n", st.TLS.Host)
 	}
-	if st.Reality != nil || st.WS != nil {
+	if st.Reality != nil || st.WS != nil || st.Argo != nil {
 		d := "伪装登录页"
 		if st.Disguise.Mode == "proxy" {
 			d = "反代 " + st.Disguise.URL
@@ -526,22 +595,23 @@ func menu(st *State) {
   3. 安装 CF WS（套 Cloudflare）
   4. 三个一起装
   5. 安装 Hysteria2（UDP，线路差的机器用）
+  6. Argo 隧道（VLESS + XHTTP，VPS 不开端口）
 ────────────────────────────────────────────
-  6. 查看订阅和节点链接
-  7. 查看 mihomo / Clash 配置
-  8. 优选地址和订阅
-  9. 伪装站：登录页 / 反代网站
- 10. 修改端口
- 11. 重置密码 / UUID
- 12. 卸载单个协议
- 13. 服务：重启 / 停止 / 日志
- 14. 更新 sing-box
- 15. 开启 BBR
- 16. IP 变了：同步解析
- 17. 更换节点域名
- 18. 更换 CF 账号
- 19. 更新 dun
- 20. 全部卸载
+  7. 查看订阅和节点链接
+  8. 查看 mihomo / Clash 配置
+  9. 优选地址和订阅
+ 10. 伪装站：登录页 / 反代网站
+ 11. 修改端口
+ 12. 重置密码 / UUID
+ 13. 卸载单个协议
+ 14. 服务：重启 / 停止 / 日志
+ 15. 更新内核（sing-box / Xray / cloudflared）
+ 16. 开启 BBR
+ 17. IP 变了：同步解析
+ 18. 更换节点域名
+ 19. 更换 CF 账号
+ 20. 更新 dun
+ 21. 全部卸载
   0. 退出
 `)
 		switch ask("请选择", "") {
@@ -563,35 +633,37 @@ func menu(st *State) {
 			installHy2(st)
 			showLinks(st)
 		case "6":
-			showLinks(st)
+			argoMenu(st)
 		case "7":
-			showMihomo(st)
+			showLinks(st)
 		case "8":
-			cfipMenu(st)
+			showMihomo(st)
 		case "9":
-			disguiseMenu(st)
+			cfipMenu(st)
 		case "10":
-			changePort(st)
+			disguiseMenu(st)
 		case "11":
-			resetSecret(st)
+			changePort(st)
 		case "12":
-			removeOne(st)
+			resetSecret(st)
 		case "13":
-			serviceMenu()
+			removeOne(st)
 		case "14":
-			updateCore(st)
+			serviceMenu()
 		case "15":
-			enableBBR()
+			updateCore(st)
 		case "16":
-			syncIP(st)
+			enableBBR()
 		case "17":
+			syncIP(st)
+		case "18":
 			changeNodeHost(st)
 			showLinks(st)
-		case "18":
-			changeCF(st)
 		case "19":
-			updateSelf()
+			changeCF(st)
 		case "20":
+			updateSelf()
+		case "21":
 			uninstallAll(st)
 		case "0", "q":
 			return
@@ -610,6 +682,12 @@ func activeSvcs() []string {
 	}
 	if st.installed() {
 		ss = append(ss, svcWeb)
+	}
+	if st.Argo != nil {
+		ss = append(ss, svcXray)
+		if !st.Argo.External {
+			ss = append(ss, svcArgo)
+		}
 	}
 	return ss
 }

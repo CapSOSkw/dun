@@ -176,6 +176,7 @@ func applyAll(st *State) {
 		svcDo("restart", svcBox)
 	}
 	hopApply(st)
+	xrayApply(st)
 	if st.installed() {
 		svcEnable(svcWeb)
 		svcDo("restart", svcWeb)
@@ -196,6 +197,9 @@ func applyAll(st *State) {
 	}
 	if st.WS != nil {
 		want = append(want, st.WS.Port, st.WS.Inner)
+	}
+	if st.Argo != nil {
+		want = append(want, st.Argo.Inner, st.Argo.Web)
 	}
 	for i := 0; i < 20; i++ {
 		bad := 0

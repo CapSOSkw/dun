@@ -70,15 +70,29 @@ func (c *CF) do(method, path string, body any, out any) error {
 func (c *CF) Check() error { return c.do("GET", "/user", nil, nil) }
 
 type cfZone struct {
-	ID   string   `json:"id"`
-	Name string   `json:"name"`
-	NS   []string `json:"name_servers"`
+	ID      string   `json:"id"`
+	Name    string   `json:"name"`
+	NS      []string `json:"name_servers"`
+	Account struct {
+		ID string `json:"id"`
+	} `json:"account"`
 }
 
 func (c *CF) Zones() ([]cfZone, error) {
 	var z []cfZone
 	err := c.do("GET", "/zones?per_page=50&status=active", nil, &z)
 	return z, err
+}
+
+func (c *CF) ZoneAccount(zid string) (string, error) {
+	var z cfZone
+	if err := c.do("GET", "/zones/"+zid, nil, &z); err != nil {
+		return "", err
+	}
+	if z.Account.ID == "" {
+		return "", errors.New("CF 没返回账户 ID")
+	}
+	return z.Account.ID, nil
 }
 
 type cfRecord struct {
@@ -160,6 +174,102 @@ func (c *CF) Setting(zid, name string) string {
 
 func (c *CF) SetSetting(zid, name string, v any) error {
 	return c.do("PATCH", "/zones/"+zid+"/settings/"+name, map[string]any{"value": v}, nil)
+}
+
+// Bot Fight Mode 只能整个域名开关，免费版没法按子域名放行
+func (c *CF) BotManagement(zid string) (map[string]any, error) {
+	var m map[string]any
+	err := c.do("GET", "/zones/"+zid+"/bot_management", nil, &m)
+	return m, err
+}
+
+// 只关 fight_mode；免费版能改的另外两项原样带回去，免得被重置
+func (c *CF) BotFightOff(zid string, cur map[string]any) error {
+	body := map[string]any{"fight_mode": false}
+	for _, k := range []string{"enable_js", "ai_bots_protection"} {
+		if v, ok := cur[k]; ok {
+			body[k] = v
+		}
+	}
+	return c.do("PUT", "/zones/"+zid+"/bot_management", body, nil)
+}
+
+// ── Cloudflare Tunnel ───────────────────────────────
+type cfTunnel struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Status    string `json:"status"` // inactive / degraded / healthy / down
+	Token     string `json:"token"`
+	ConfigSrc string `json:"config_src"`    // cloudflare = 远程管理（用 token 跑），local = 本地配置文件
+	Remote    bool   `json:"remote_config"` // 老字段，意思同上
+	Conns     []struct {
+		Colo     string `json:"colo_name"`
+		OriginIP string `json:"origin_ip"` // 跑 cloudflared 的那台机器的公网 IP
+	} `json:"connections"`
+}
+
+// 远程管理的隧道，路由才能用 API 改
+func (t *cfTunnel) remote() bool { return t.ConfigSrc == "cloudflare" || t.Remote }
+
+func (c *CF) Tunnels(acc string) ([]cfTunnel, error) {
+	var ts []cfTunnel
+	err := c.do("GET", "/accounts/"+acc+"/cfd_tunnel?is_deleted=false&per_page=100", nil, &ts)
+	return ts, err
+}
+
+// 隧道的远程配置原样读出来：只改路由，别的设置要原样写回去
+func (c *CF) TunnelConfig(acc, id string) (map[string]any, error) {
+	var r struct {
+		Config map[string]any `json:"config"`
+	}
+	err := c.do("GET", "/accounts/"+acc+"/cfd_tunnel/"+id+"/configurations", nil, &r)
+	if r.Config == nil {
+		r.Config = map[string]any{}
+	}
+	return r.Config, err
+}
+
+func (c *CF) TunnelConfigPut(acc, id string, cfg map[string]any) error {
+	return c.do("PUT", "/accounts/"+acc+"/cfd_tunnel/"+id+"/configurations", map[string]any{"config": cfg}, nil)
+}
+
+// 远程管理的隧道：路由存在 CF 上，服务器上的 cloudflared 只要 token
+func (c *CF) TunnelCreate(acc, name string) (*cfTunnel, error) {
+	t := &cfTunnel{}
+	err := c.do("POST", "/accounts/"+acc+"/cfd_tunnel", map[string]any{"name": name, "config_src": "cloudflare"}, t)
+	return t, err
+}
+
+func (c *CF) TunnelGet(acc, id string) (*cfTunnel, error) {
+	t := &cfTunnel{}
+	err := c.do("GET", "/accounts/"+acc+"/cfd_tunnel/"+id, nil, t)
+	return t, err
+}
+
+func (c *CF) TunnelToken(acc, id string) (string, error) {
+	var s string
+	err := c.do("GET", "/accounts/"+acc+"/cfd_tunnel/"+id+"/token", nil, &s)
+	return s, err
+}
+
+// 隧道现有路由里的域名
+func (c *CF) TunnelHosts(acc, id string) ([]string, error) {
+	cfg, err := c.TunnelConfig(acc, id)
+	if err != nil {
+		return nil, err
+	}
+	return ingressHosts(cfg["ingress"]), nil
+}
+
+func (c *CF) TunnelIngress(acc, id string, ingress []map[string]any) error {
+	return c.do("PUT", "/accounts/"+acc+"/cfd_tunnel/"+id+"/configurations",
+		map[string]any{"config": map[string]any{"ingress": ingress}}, nil)
+}
+
+// 先清掉还挂着的连接，不然删不掉
+func (c *CF) TunnelDelete(acc, id string) error {
+	c.do("DELETE", "/accounts/"+acc+"/cfd_tunnel/"+id+"/connections", nil, nil)
+	return c.do("DELETE", "/accounts/"+acc+"/cfd_tunnel/"+id, nil, nil)
 }
 
 // ── 凭据 ─────────────────────────────────────────────

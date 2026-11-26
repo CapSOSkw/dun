@@ -15,15 +15,15 @@ import (
 var version = "dev"
 
 func usage() {
-	fmt.Printf(`dun %s：Reality 偷自己 / AnyTLS / CF WS 一键节点
+	fmt.Printf(`dun %s：Reality 偷自己 / AnyTLS / CF WS / Argo 隧道 一键节点
   dun                          打开管理菜单
-  dun install <reality|anytls|ws|all|hy2>
-  dun remove  <reality|anytls|ws|hy2>
+  dun install <reality|anytls|ws|all|hy2|argo>
+  dun remove  <reality|anytls|ws|hy2|argo>
   dun links                    查看订阅和链接
   dun mihomo                   输出 mihomo / Clash 配置
   dun cfip                     立即刷新优选 IP
   dun restart|stop|start|log
-  dun update                   更新 sing-box
+  dun update                   更新内核（sing-box，装了 Argo 还有 Xray、cloudflared）
   dun upgrade                  更新 dun 自己
   dun renew                    立即续期证书（平时会自动续）
   dun bbr                      开启 BBR
@@ -83,6 +83,9 @@ func firstSetup() *State {
 	if !servicesWritten() {
 		writeServices()
 	}
+	if st.Argo != nil {
+		ensureArgoBins(!st.Argo.External)
+	}
 	if st.IP4 == "" && st.IP6 == "" {
 		detectIP(st)
 	}
@@ -99,15 +102,28 @@ func firstSetup() *State {
 			svcDo("restart", svcWeb)
 		}
 	}
-	// 升级 dun 以后配置格式可能变了，对不上就按新版本重新生成
+	if configStale(st) {
+		applyAll(st)
+		ok("配置已按 dun %s 更新", version)
+	}
+	return st
+}
+
+// 升级 dun 以后配置格式可能变了，和按新版本生成的对不上就要重新应用
+func configStale(st *State) bool {
 	if cfg, n := sbConfig(st); n > 0 {
 		want, _ := json.MarshalIndent(cfg, "", "  ")
 		if cur, _ := os.ReadFile(sbConf); !bytes.Equal(cur, want) {
-			applyAll(st)
-			ok("配置已按 dun %s 更新", version)
+			return true
 		}
 	}
-	return st
+	if st.Argo != nil {
+		want, _ := json.MarshalIndent(xrayConfig(st), "", "  ")
+		if cur, _ := os.ReadFile(xrayConf); !bytes.Equal(cur, want) {
+			return true
+		}
+	}
+	return false
 }
 
 func main() {
@@ -121,6 +137,9 @@ func main() {
 		return
 	case "serve":
 		serve()
+		return
+	case "tunnel": // dun-argo 服务用
+		runTunnel()
 		return
 	}
 	if runtime.GOOS != "linux" {
@@ -152,6 +171,8 @@ func main() {
 			installWS(st)
 		case "hy2":
 			installHy2(st)
+		case "argo":
+			installArgo(st)
 		case "all":
 			installReality(st)
 			installAnyTLS(st)
@@ -171,6 +192,8 @@ func main() {
 			removeWS(st)
 		case "hy2":
 			removeHy2(st)
+		case "argo":
+			removeArgo(st)
 		default:
 			usage()
 			os.Exit(1)

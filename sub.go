@@ -287,11 +287,73 @@ func linkWS(st *State, a CFAddr) string {
 		w.UUID, hostPort(a.Addr, a.Port), w.Host, w.Host, url.QueryEscape(w.Path), frag(a.Name))
 }
 
+// 经过 Argo 只有 packet-up 能通；h2 走 TCP，h3 走 UDP（QUIC）
+func linkArgo(st *State, a CFAddr, h3 bool) string {
+	g := st.Argo
+	alpn := "h2"
+	if h3 {
+		alpn = "h3"
+	}
+	return fmt.Sprintf("vless://%s@%s?encryption=none&security=tls&sni=%s&fp=chrome&alpn=%s&type=xhttp&host=%s&path=%s&mode=packet-up#%s",
+		g.UUID, hostPort(a.Addr, a.Port), g.Host, alpn, g.Host, url.QueryEscape(g.Path), frag(a.Name))
+}
+
 type node struct {
 	name, link, clash string
 }
 
 func q(s string) string { return strconv.Quote(s) }
+
+// 节点名进 YAML 和链接，去掉引号和反斜杠；重名的加序号
+func uniqName(seen map[string]int, s string) string {
+	s = strings.NewReplacer(`"`, "", `\`, "").Replace(s)
+	seen[s]++
+	if c := seen[s]; c > 1 {
+		s = fmt.Sprintf("%s-%d", s, c)
+	}
+	return s
+}
+
+// Argo 节点：隧道域名本身加上优选地址池（和 CF WS 共用），每个地址出 TCP 和 UDP 两个
+func argoNodes(st *State, base string) []node {
+	g := st.Argo
+	addrs := []CFAddr{{Addr: g.Host, Port: 443, Name: base + "-Argo"}}
+	for _, a := range cfAddrs(st) {
+		a.Name = "Argo-" + a.Name
+		addrs = append(addrs, a)
+	}
+	var ns []node
+	seen := map[string]int{}
+	for _, a := range addrs {
+		a.Name = uniqName(seen, a.Name)
+		for _, h3 := range []bool{false, true} {
+			if h3 && st.CFIP.NoH3 {
+				continue
+			}
+			x, alpn := a, "h2"
+			if h3 {
+				x.Name, alpn = a.Name+"-UDP", "h3"
+			}
+			ns = append(ns, node{x.Name, linkArgo(st, x, h3), fmt.Sprintf(`  - name: %s
+    type: vless
+    server: %s
+    port: %d
+    uuid: %s
+    network: xhttp
+    tls: true
+    udp: true
+    servername: %s
+    client-fingerprint: chrome
+    alpn: [%s]
+    xhttp-opts:
+      path: %s
+      host: %s
+      mode: packet-up
+`, q(x.Name), q(x.Addr), x.Port, g.UUID, g.Host, alpn, q(g.Path), g.Host)})
+		}
+	}
+	return ns
+}
 
 func buildNodes(st *State) []node {
 	var ns []node
@@ -345,16 +407,15 @@ func buildNodes(st *State) []node {
     alpn: [h3]
 `, q(n), st.TLS.Host, h.PubPort, extra, q(h.Password), st.TLS.Host)})
 	}
+	if st.Argo != nil {
+		ns = append(ns, argoNodes(st, base)...)
+	}
 	if st.WS != nil {
 		w := st.WS
 		addrs := append([]CFAddr{{Addr: w.Host, Port: 443, Name: base + "-CF-WS"}}, cfAddrs(st)...)
 		seen := map[string]int{}
 		for _, a := range addrs {
-			a.Name = strings.NewReplacer(`"`, "", `\`, "").Replace(a.Name)
-			seen[a.Name]++
-			if c := seen[a.Name]; c > 1 {
-				a.Name = fmt.Sprintf("%s-%d", a.Name, c)
-			}
+			a.Name = uniqName(seen, a.Name)
 			ns = append(ns, node{a.Name, linkWS(st, a), fmt.Sprintf(`  - name: %s
     type: vless
     server: %s
@@ -512,6 +573,10 @@ func subClash(st *State) string {
 func subBase(st *State) string {
 	if st.Token == "" {
 		return ""
+	}
+	// 走 Argo 隧道最稳：VPS 的 IP 被墙了也能更新，还不暴露 IP
+	if st.Argo != nil {
+		return "https://" + st.Argo.Host + "/" + st.Token
 	}
 	if st.WS != nil {
 		return "https://" + st.WS.Host + "/" + st.Token

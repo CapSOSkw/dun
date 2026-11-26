@@ -23,6 +23,13 @@ const (
 	svcBox      = "dun-sb"
 	svcWeb      = "dun"
 	rulePrefix  = "dun ws "
+	xrayBin     = baseDir + "/bin/xray"
+	xrayConf    = baseDir + "/xray.json"
+	cfdBin      = baseDir + "/bin/cloudflared"
+	argoToken   = baseDir + "/argo.token"
+	svcXray     = "dun-xray"
+	svcArgo     = "dun-argo"
+	argoPrefix  = "dun argo "
 )
 
 // dun upgrade 从这个仓库的 Release 拉新版本；发版时 workflow 会用 -X main.repo 注入当前仓库
@@ -38,9 +45,10 @@ type DNSRecord struct {
 }
 
 type Zone struct {
-	ID   string   `json:"id"`
-	Name string   `json:"name"`
-	NS   []string `json:"ns,omitempty"`
+	ID      string   `json:"id"`
+	Name    string   `json:"name"`
+	NS      []string `json:"ns,omitempty"`
+	Account string   `json:"account,omitempty"` // CF 账户 ID，建 Argo 隧道要用
 }
 
 type TLSHost struct {
@@ -93,6 +101,25 @@ type WS struct {
 	Backup   []DNSRecord `json:"backup,omitempty"`
 }
 
+// Argo 隧道：cloudflared 从 VPS 主动连 CF，VPS 不开公网端口。
+// 隧道路由由 dun 用 API 写在 CF 上，token 单独存在 argoToken 里。
+// XHTTP 只有 Xray 支持（sing-box 没有），所以这一个入站由 Xray 跑
+type Argo struct {
+	Host     string      `json:"host"` // 只能是一级子域名，CF 的免费证书只覆盖一级
+	RecordID string      `json:"record_id"`
+	Backup   []DNSRecord `json:"backup,omitempty"`
+	Tunnel   string      `json:"tunnel"`
+	TName    string      `json:"tunnel_name,omitempty"`
+	Manual   bool        `json:"manual,omitempty"`   // 隧道是用户在 CF 后台手动建的，cloudflared 由 dun 跑
+	External bool        `json:"external,omitempty"` // 复用已有隧道：cloudflared 由这台机器上别的程序跑，dun 只往里加路由
+	Inner    int         `json:"inner"`              // Xray，只监听 127.0.0.1
+	Web      int         `json:"web"`                // dun 的伪装站和订阅，只监听 127.0.0.1
+	Metrics  int         `json:"metrics"`            // cloudflared 的指标端口，固定下来免得占到 dun 的端口
+	UUID     string      `json:"uuid"`
+	Path     string      `json:"path"`
+	HTTP2    bool        `json:"http2,omitempty"` // 隧道协议：默认 auto（QUIC 优先），UDP 出不去的机器改 http2
+}
+
 // Mode 为空是假登录页，proxy 是反代 URL
 type Disguise struct {
 	Mode string `json:"mode,omitempty"`
@@ -100,11 +127,12 @@ type Disguise struct {
 	Seed uint64 `json:"seed,omitempty"` // 伪装登录页的随机种子
 }
 
-// 零值就是默认：开 wetest、开内置域名、不要 IPv6
+// 零值就是默认：开 wetest、开内置域名、不要 IPv6、Argo 节点带 UDP（h3）版
 type CFIPOpt struct {
 	NoWetest  bool `json:"no_wetest,omitempty"`
 	NoDomains bool `json:"no_domains,omitempty"`
 	V6        bool `json:"v6,omitempty"`
+	NoH3      bool `json:"no_h3,omitempty"`
 }
 
 type State struct {
@@ -117,6 +145,7 @@ type State struct {
 	AnyTLS   *AnyTLS  `json:"anytls,omitempty"`
 	WS       *WS      `json:"ws,omitempty"`
 	Hy2      *Hy2     `json:"hy2,omitempty"`
+	Argo     *Argo    `json:"argo,omitempty"`
 	Disguise Disguise `json:"disguise"`
 	Token    string   `json:"token,omitempty"`
 	CFIP     CFIPOpt  `json:"cfip"`
@@ -140,7 +169,7 @@ func (s *State) save() {
 }
 
 func (s *State) installed() bool {
-	return s.Reality != nil || s.AnyTLS != nil || s.WS != nil || s.Hy2 != nil
+	return s.Reality != nil || s.AnyTLS != nil || s.WS != nil || s.Hy2 != nil || s.Argo != nil
 }
 
 // 节点域名和证书被谁用着

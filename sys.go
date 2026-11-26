@@ -117,8 +117,39 @@ RestartSec=3
 [Install]
 WantedBy=multi-user.target
 `, selfPath)
+		xray := fmt.Sprintf(`[Unit]
+Description=dun Xray（Argo 的 XHTTP 入站）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=%s run -c %s
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+`, xrayBin, xrayConf)
+		// dun tunnel 读状态拼好参数再换成 cloudflared，切换隧道协议不用改服务文件
+		argo := fmt.Sprintf(`[Unit]
+Description=dun Argo 隧道（cloudflared）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=%s tunnel
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+`, selfPath)
 		os.WriteFile("/etc/systemd/system/"+svcBox+".service", []byte(box), 0644)
 		os.WriteFile("/etc/systemd/system/"+svcWeb+".service", []byte(web), 0644)
+		os.WriteFile("/etc/systemd/system/"+svcXray+".service", []byte(xray), 0644)
+		os.WriteFile("/etc/systemd/system/"+svcArgo+".service", []byte(argo), 0644)
 		run("systemctl", "daemon-reload")
 		return
 	}
@@ -135,11 +166,14 @@ depend() { need net; after firewall; }
 `
 		os.WriteFile("/etc/init.d/"+svcBox, []byte(fmt.Sprintf(tpl, svcBox, sbBin, "run -c "+sbConf, svcBox, svcBox)), 0755)
 		os.WriteFile("/etc/init.d/"+svcWeb, []byte(fmt.Sprintf(tpl, svcWeb, selfPath, "serve", svcWeb, svcWeb)), 0755)
+		os.WriteFile("/etc/init.d/"+svcXray, []byte(fmt.Sprintf(tpl, svcXray, xrayBin, "run -c "+xrayConf, svcXray, svcXray)), 0755)
+		os.WriteFile("/etc/init.d/"+svcArgo, []byte(fmt.Sprintf(tpl, svcArgo, selfPath, "tunnel", svcArgo, svcArgo)), 0755)
 	}
 }
 
+// 老版本升级上来没有 Xray 和隧道的服务文件，也要补写一遍
 func servicesWritten() bool {
-	return exists("/etc/systemd/system/"+svcWeb+".service") || exists("/etc/init.d/"+svcWeb)
+	return svcExists(svcWeb) && svcExists(svcArgo)
 }
 
 func svcDo(action, name string) error {
@@ -174,8 +208,12 @@ func svcActive(name string) bool {
 }
 
 func svcLog(n int, follow bool) {
+	all := []string{svcBox, svcWeb, svcXray, svcArgo}
 	if initSys == "systemd" {
-		args := []string{"-u", svcBox, "-u", svcWeb, "--no-pager", "-o", "short", "-n", strconv.Itoa(n)}
+		args := []string{"--no-pager", "-o", "short", "-n", strconv.Itoa(n)}
+		for _, s := range all {
+			args = append(args, "-u", s)
+		}
 		if follow {
 			args = append(args, "-f")
 		}
@@ -186,7 +224,18 @@ func svcLog(n int, follow bool) {
 	if follow {
 		args = append(args, "-f")
 	}
-	runTTY("tail", append(args, "/var/log/"+svcBox+".log", "/var/log/"+svcWeb+".log")...)
+	files := 0
+	for _, s := range all {
+		if f := "/var/log/" + s + ".log"; exists(f) {
+			args = append(args, f)
+			files++
+		}
+	}
+	if files == 0 {
+		warn("还没有日志")
+		return
+	}
+	runTTY("tail", args...)
 }
 
 // ── 端口 ─────────────────────────────────────────────
@@ -258,7 +307,7 @@ func sockOwner(port int, udp bool) string {
 			}
 			cmd, _ := os.ReadFile(dir + "/cmdline")
 			c := strings.TrimSpace(strings.ReplaceAll(string(cmd), "\x00", " "))
-			if strings.Contains(c, sbConf) || strings.HasSuffix(c, "dun serve") {
+			if strings.Contains(c, sbConf) || strings.Contains(c, xrayConf) || strings.HasSuffix(c, "dun serve") {
 				return "ours"
 			}
 			if comm, _ := os.ReadFile(dir + "/comm"); len(strings.TrimSpace(string(comm))) > 0 {
@@ -287,6 +336,11 @@ func (s *State) usedPorts(skip string) map[int]string {
 			m[s.WS.Port] = "ws"
 		}
 	}
+	if s.Argo != nil {
+		m[s.Argo.Inner] = "argo"
+		m[s.Argo.Web] = "argo"
+		m[s.Argo.Metrics] = "argo"
+	}
 	return m
 }
 
@@ -297,6 +351,9 @@ func randPort(st *State, avoid ...int) int {
 	}
 	for i := 0; i < 100; i++ {
 		p := 20000 + rand.IntN(40000)
+		if p >= 20241 && p <= 20245 { // 别的 cloudflared 默认拿这几个做监控端口，开机时可能抢先占掉
+			continue
+		}
 		if _, u := used[p]; !u && portOwner(p) == "" {
 			return p
 		}
