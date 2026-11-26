@@ -127,13 +127,18 @@ type Disguise struct {
 	Seed uint64 `json:"seed,omitempty"` // 伪装登录页的随机种子
 }
 
-// 零值就是默认：开 wetest、开内置域名、不要 IPv6、Argo 节点带 UDP（h3）版
+// 零值就是默认：只用内置的东京 IP；wetest 三网 IP 和内置优选域名默认关（实测从上海电信多半落新加坡、美西，走 Argo 很慢）；
+// 不要 IPv6；Argo 节点带 UDP（h3）版
 type CFIPOpt struct {
-	NoWetest  bool `json:"no_wetest,omitempty"`
-	NoDomains bool `json:"no_domains,omitempty"`
-	V6        bool `json:"v6,omitempty"`
-	NoH3      bool `json:"no_h3,omitempty"`
+	NoTokyo bool `json:"no_tokyo,omitempty"`
+	Wetest  bool `json:"wetest,omitempty"`
+	Domains bool `json:"domains,omitempty"`
+	V6      bool `json:"v6,omitempty"`
+	NoH3    bool `json:"no_h3,omitempty"`
 }
+
+// wetest 和内置域名都要定时去外面拉、去解析；两个都关着就不用刷新
+func (o CFIPOpt) fetches() bool { return o.Wetest || o.Domains }
 
 type State struct {
 	IP4      string   `json:"ip4,omitempty"`

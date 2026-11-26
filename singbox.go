@@ -57,20 +57,24 @@ func sbInstall(ver string) {
 	if ver == "" {
 		die("拿不到 sing-box 最新版本号，检查能不能访问 GitHub")
 	}
-	u := fmt.Sprintf("https://github.com/SagerNet/sing-box/releases/download/v%s/sing-box-%s-linux-%s.tar.gz", ver, ver, sbArch())
+	name := fmt.Sprintf("sing-box-%s-linux-%s.tar.gz", ver, sbArch())
 	info("下载 sing-box %s (%s)", ver, sbArch())
-	c := &http.Client{Timeout: 5 * time.Minute}
-	resp, err := c.Get(u)
-	if err != nil || resp.StatusCode != 200 {
-		die("sing-box 下载失败: %s", u)
+	os.MkdirAll(path.Dir(sbBin), 0755)
+	tgz := sbBin + ".tar.gz"
+	defer os.Remove(tgz)
+	if err := downloadVerified("SagerNet/sing-box", "v"+ver, name, tgz, 0600); err != nil {
+		die("sing-box 下载失败：%v", err)
 	}
-	defer resp.Body.Close()
-	gz, err := gzip.NewReader(resp.Body)
+	pkg, err := os.Open(tgz)
+	if err != nil {
+		die("%v", err)
+	}
+	defer pkg.Close()
+	gz, err := gzip.NewReader(pkg)
 	if err != nil {
 		die("sing-box 包解不开: %v", err)
 	}
 	tr := tar.NewReader(gz)
-	os.MkdirAll(path.Dir(sbBin), 0755)
 	for {
 		h, err := tr.Next()
 		if err != nil {

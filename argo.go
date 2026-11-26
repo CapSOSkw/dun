@@ -99,12 +99,11 @@ func xrayInstall(ver string) {
 	if arch == "" {
 		die("Xray 暂不支持 %s", runtime.GOARCH)
 	}
-	u := fmt.Sprintf("https://github.com/XTLS/Xray-core/releases/download/v%s/Xray-linux-%s.zip", ver, arch)
 	info("下载 Xray %s", ver)
 	os.MkdirAll(path.Dir(xrayBin), 0755)
 	zf := xrayBin + ".zip"
 	defer os.Remove(zf)
-	if err := download(u, zf, 0600); err != nil {
+	if err := downloadVerified("XTLS/Xray-core", "v"+ver, "Xray-linux-"+arch+".zip", zf, 0600); err != nil {
 		die("Xray 下载失败: %v", err)
 	}
 	if err := unzipOne(zf, "xray", xrayBin+".new"); err != nil {
@@ -124,10 +123,9 @@ func cfdInstall(ver string) {
 	if runtime.GOARCH != "amd64" && runtime.GOARCH != "arm64" {
 		die("cloudflared 暂不支持 %s", runtime.GOARCH)
 	}
-	u := fmt.Sprintf("https://github.com/cloudflare/cloudflared/releases/download/%s/cloudflared-linux-%s", ver, runtime.GOARCH)
 	info("下载 cloudflared %s", ver)
 	os.MkdirAll(path.Dir(cfdBin), 0755)
-	if err := download(u, cfdBin+".new", 0755); err != nil {
+	if err := downloadVerified("cloudflare/cloudflared", ver, "cloudflared-linux-"+runtime.GOARCH, cfdBin+".new", 0755); err != nil {
 		die("cloudflared 下载失败: %v", err)
 	}
 	placeBin(cfdBin, "cloudflared", cfdVersion)
@@ -441,54 +439,58 @@ func connectorPlace(t *cfTunnel, local map[string]bool) (here bool, others []str
 	return len(t.Conns) > 0 && len(others) == 0, others
 }
 
-// 列出能复用的隧道让用户选；返回 nil 表示改成新建
-func pickTunnel(st *State, c *CF, acc string, ts []cfTunnel) *cfTunnel {
+// 列出隧道让用户选。只有能复用的才进选择列表，不能用的单独列出原因；一条能用的都没有就直接问要不要改成新建。
+// 返回的隧道为 nil 表示改成新建；cancel 表示用户放弃安装
+func pickTunnel(st *State, c *CF, acc string, ts []cfTunnel) (reuse *cfTunnel, cancel bool) {
 	local := localIPs(st)
 	var cand []cfTunnel
-	var labels []string
-	skipped := 0
+	var labels, bad []string
+	moved := false
 	for _, t := range ts {
 		if !t.remote() {
-			skipped++
+			bad = append(bad, t.Name+"：用的是本地配置文件，API 改不了它的路由")
 			continue
 		}
-		where := "没有连接器在跑"
-		if here, others := connectorPlace(&t, local); here {
-			where = "连接器在这台机器上"
-		} else if len(others) > 0 {
-			where = "连接器在别的机器上（" + strings.Join(others, "、") + "）"
-		}
-		l := t.Name + "  " + where
+		l := t.Name
 		if hs, err := c.TunnelHosts(acc, t.ID); err == nil && len(hs) > 0 {
-			l += "，路由：" + strings.Join(hs, "、")
+			l += "（路由：" + strings.Join(hs, "、") + "）"
 		}
-		cand, labels = append(cand, t), append(labels, l)
+		here, others := connectorPlace(&t, local)
+		switch {
+		case here:
+			cand, labels = append(cand, t), append(labels, l)
+		case len(others) > 0:
+			bad = append(bad, l+"：连接器在别的机器上（"+strings.Join(others, "、")+"）")
+			moved = true
+		default:
+			bad = append(bad, l+"：现在没有连接器在跑，确认不了它在哪台机器上")
+		}
 	}
-	if skipped > 0 {
-		info("另有 %d 条隧道用的是本地配置文件，API 改不了它们的路由，没列出来", skipped)
+	if len(bad) > 0 {
+		info("这些隧道不能复用（复用要求它的 cloudflared 就跑在这台机器上）：")
+		for _, b := range bad {
+			fmt.Fprintln(os.Stderr, "  - "+b)
+		}
+		if moved {
+			info("如果「别的机器」其实就是这台（比如 IP 刚变过），先执行 dun syncip 再来")
+		}
 	}
 	if len(cand) == 0 {
-		warn("没有能复用的隧道，改成新建")
-		return nil
+		warn("没有能复用的隧道")
+		if confirm("改成新建一条隧道？", true) {
+			return nil, false
+		}
+		return nil, true
 	}
-	for {
-		i := choose(labels, 1)
-		if i < 0 {
-			return nil
-		}
-		t := cand[i]
-		here, others := connectorPlace(&t, local)
-		if here {
-			return &t
-		}
-		if len(others) > 0 {
-			warn("这条隧道的连接器在别的机器上。dun 的路由指向本机，CF 会把请求分到那台机器，用不了")
-			info("如果那其实就是这台机器（比如 IP 刚变过），先执行 dun syncip 再来")
-		} else {
-			warn("这条隧道现在没有连接器在跑，dun 确认不了它跑在哪台机器上，用不了")
-		}
-		info("复用的前提：这条隧道的 cloudflared 就跑在这台机器上。换一条，或者选 0 改成新建")
+	info("能复用的隧道：")
+	i := choose(append(labels, "不复用了，新建一条"), 1)
+	switch {
+	case i < 0:
+		return nil, true
+	case i == len(cand):
+		return nil, false
 	}
+	return &cand[i], false
 }
 
 func ingressHosts(v any) []string {
@@ -710,7 +712,11 @@ func installArgo(st *State) {
 			case -1:
 				return
 			case 1:
-				if reuse = pickTunnel(st, c, acc, ts); reuse != nil {
+				var cancel bool
+				if reuse, cancel = pickTunnel(st, c, acc, ts); cancel {
+					return
+				}
+				if reuse != nil {
 					info("复用隧道 %s：dun 只往里加两条路由，不另跑 cloudflared；那个 cloudflared 停了，Argo 节点也会断", reuse.Name)
 				}
 			}
@@ -779,7 +785,7 @@ func installArgo(st *State) {
 	applyAll(st)
 	argoWait(st, c)
 	argoProbe(st)
-	if st.WS == nil && !st.CFIP.NoWetest {
+	if st.WS == nil && st.CFIP.fetches() {
 		if n, err := refreshWetest(st); err != nil {
 			warn("优选 IP 拉取失败，先只用内置优选域名：%v", err)
 		} else {

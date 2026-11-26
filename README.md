@@ -12,7 +12,9 @@ dun 是一个 Go 写的单文件程序。节点由官方 sing-box 跑，Argo 的
 
 - 一台 VPS，root 登录。带 systemd 的 Linux 都行，比如 Debian、Ubuntu、CentOS、Alma、Rocky，amd64 和 arm64 都支持
 - 一个已经接入 Cloudflare 的域名
-- Cloudflare 的 Global API Key。在 CF 后台点右上角头像，进「我的个人资料」→「API 令牌」，Global API Key 那一栏点「查看」
+- Cloudflare 的 Global API Key。在 CF 后台点右上角头像 →「设置」，左栏 User settings 下展开「API 凭据」→「API 密钥」，Global API Key 那一行点「查看」
+
+第一次装、想看详细步骤的，看 [安装教程](docs/安装教程.md)：域名怎么接入 Cloudflare、安装时会问什么、客户端怎么导入、连不上怎么查，都在里面。
 
 登录 VPS，执行：
 
@@ -47,9 +49,12 @@ dun uninstall            # 全部卸载
 
 订阅地址优先走 Argo 隧道的域名，没装 Argo 就走 CF WS 的域名，VPS 的 IP 被墙了也能更新。订阅里除了原始的 CF WS、Argo 节点，还会带上一批优选地址：
 
-- wetest 的三网优选 IP，每 3 小时自动刷新
-- 内置优选域名，刷新时逐个解析，解析不到 Cloudflare 的自动剔除
+- 内置的东京 IP（默认开）：从上海电信实测，走 Argo 落在 Cloudflare 东京机房，晚高峰 20-40 MB/s
+- wetest 的三网优选 IP（默认关），每 3 小时自动刷新。实测电信的那几个多半落在新加坡，走 Argo 很慢，所以默认不用
+- 内置优选域名（默认关），刷新时逐个解析，解析不到 Cloudflare 的自动剔除
 - 你自己加的地址，菜单「优选地址和订阅」里添加，格式是 `地址[:端口][#备注]`
+
+哪个机房最快要看你的运营商。内置东京 IP 是按上海电信测的，别的线路可以在菜单 9 里关掉它、打开 wetest，或者加自己测出来的 IP。
 
 这些都在你自己的 VPS 上生成，不经过任何第三方订阅服务。订阅地址里带一段随机字符，泄露了就在菜单里重置。
 

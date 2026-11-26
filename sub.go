@@ -222,12 +222,25 @@ func parseAddr(line string) (CFAddr, bool) {
 	return CFAddr{Addr: addr, Port: port, Name: "自选-" + name}, true
 }
 
+// 东京（NRT）的 CF IP，都是 2026-11 从上海电信实测过的：走 Argo 落在东京，晚高峰 20-40 MB/s；
+// 同期新加坡的 IP 走 Argo 延迟 2 秒左右、只有 0.2 MB/s。
+// 别的运营商、别的地区落在哪个机房可能不一样，在菜单「优选地址」里可以关掉它、改用 wetest
+var tokyoIPs = []string{
+	"108.162.198.174", "108.162.198.101", "108.162.198.167", "108.162.198.31", "108.162.198.223",
+	"172.64.52.178", "172.64.52.113", "172.64.229.218",
+}
+
 func cfAddrs(st *State) []CFAddr {
 	var res []CFAddr
-	if !st.CFIP.NoWetest {
+	if !st.CFIP.NoTokyo {
+		for _, ip := range tokyoIPs {
+			res = append(res, CFAddr{Addr: ip, Port: 443, Name: "东京-" + ip})
+		}
+	}
+	if st.CFIP.Wetest {
 		res = append(res, loadWetest().Items...)
 	}
-	if !st.CFIP.NoDomains {
+	if st.CFIP.Domains {
 		ds := builtinDomains
 		if c := loadWetest(); c.Checked {
 			ds = c.Domains

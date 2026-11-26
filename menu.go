@@ -53,7 +53,7 @@ func showLinks(st *State) {
 		warn("还没装任何协议")
 		return
 	}
-	if (st.WS != nil || st.Argo != nil) && len(loadWetest().Items) == 0 && !st.CFIP.NoWetest {
+	if (st.WS != nil || st.Argo != nil) && len(loadWetest().Items) == 0 && st.CFIP.Wetest {
 		refreshWetest(st)
 	}
 	var b strings.Builder
@@ -312,13 +312,14 @@ func cfipMenu(st *State) {
 		if !wc.Time.IsZero() {
 			upd = wc.Time.Local().Format("01-02 15:04")
 		}
-		fmt.Fprintf(os.Stderr, "  wetest 优选 IP：%s，%d 个，更新于 %s\n", onoff(!st.CFIP.NoWetest), len(wc.Items), upd)
+		fmt.Fprintf(os.Stderr, "  东京优选 IP（内置）：%s，%d 个   自选：%d 个\n", onoff(!st.CFIP.NoTokyo), len(tokyoIPs), len(customAddrs()))
+		fmt.Fprintf(os.Stderr, "  wetest 三网优选 IP：%s，%d 个，更新于 %s\n", onoff(st.CFIP.Wetest), len(wc.Items), upd)
 		nd := len(builtinDomains)
 		if wc.Checked {
 			nd = len(wc.Domains)
 		}
-		fmt.Fprintf(os.Stderr, "  内置优选域名：%s，%d/%d 个能用   IPv6 优选：%s   自选：%d 个\n",
-			onoff(!st.CFIP.NoDomains), nd, len(builtinDomains), onoff(st.CFIP.V6), len(customAddrs()))
+		fmt.Fprintf(os.Stderr, "  内置优选域名：%s，%d/%d 个能用   IPv6 优选：%s\n",
+			onoff(st.CFIP.Domains), nd, len(builtinDomains), onoff(st.CFIP.V6))
 		n := len(cfAddrs(st)) + 1
 		var parts []string
 		if st.WS != nil {
@@ -331,10 +332,10 @@ func cfipMenu(st *State) {
 			}
 			parts = append(parts, fmt.Sprintf("Argo %d 个（UDP 版：%s）", m, onoff(!st.CFIP.NoH3)))
 		}
-		fmt.Fprintf(os.Stderr, "  订阅里的节点：%s，每 3 小时自动刷新\n", strings.Join(parts, "，"))
-		i := choose([]string{"立即刷新", "查看全部优选地址", "添加自选地址", "清空自选地址",
-			"开关 wetest 优选 IP", "开关 内置优选域名", "开关 IPv6 优选 IP",
-			"开关 Argo 的 UDP（h3）版节点", "重置订阅地址（旧订阅失效）"}, 1)
+		fmt.Fprintf(os.Stderr, "  订阅里的节点：%s\n", strings.Join(parts, "，"))
+		i := choose([]string{"立即刷新 wetest 和内置域名", "查看全部优选地址", "添加自选地址", "清空自选地址",
+			"开关 wetest 三网优选 IP（默认关：电信多半落新加坡）", "开关 内置优选域名（默认关）", "开关 IPv6 优选 IP",
+			"开关 Argo 的 UDP（h3）版节点", "重置订阅地址（旧订阅失效）", "开关 东京优选 IP（内置）"}, 1)
 		switch i {
 		case -1:
 			return
@@ -374,12 +375,20 @@ func cfipMenu(st *State) {
 		case 3:
 			os.Remove(customPath)
 			ok("已清空")
-		case 4:
-			st.CFIP.NoWetest = !st.CFIP.NoWetest
+		case 4, 5:
+			if i == 4 {
+				st.CFIP.Wetest = !st.CFIP.Wetest
+			} else {
+				st.CFIP.Domains = !st.CFIP.Domains
+			}
 			st.save()
-		case 5:
-			st.CFIP.NoDomains = !st.CFIP.NoDomains
-			st.save()
+			if st.CFIP.fetches() { // 刚打开就马上拉一次，不用等 3 小时
+				if n, err := refreshWetest(st); err != nil {
+					warn("刷新失败：%v", err)
+				} else {
+					ok("拉到 %d 个优选 IP", n)
+				}
+			}
 		case 6:
 			st.CFIP.V6 = !st.CFIP.V6
 			st.save()
@@ -391,6 +400,9 @@ func cfipMenu(st *State) {
 			st.Token = randLabel(16)
 			applyAll(st)
 			ok("新订阅地址：%s/sub", subBase(st))
+		case 9:
+			st.CFIP.NoTokyo = !st.CFIP.NoTokyo
+			st.save()
 		}
 	}
 }
@@ -477,8 +489,7 @@ func updateSelf() {
 	if latest == version && !confirm("已经是最新 "+version+"，还要重装？", false) {
 		return
 	}
-	u := fmt.Sprintf("https://github.com/%s/releases/download/v%s/dun-linux-%s", repo, latest, runtime.GOARCH)
-	if err := download(u, selfPath+".new", 0755); err != nil {
+	if err := downloadVerified(repo, "v"+latest, "dun-linux-"+runtime.GOARCH, selfPath+".new", 0755); err != nil {
 		warn("下载失败：%v", err)
 		return
 	}

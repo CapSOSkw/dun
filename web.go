@@ -249,7 +249,7 @@ func serve() {
 func wetestLoop() {
 	for {
 		st := loadState()
-		if time.Since(loadWetest().Time) > 3*time.Hour {
+		if st.CFIP.fetches() && time.Since(loadWetest().Time) > 3*time.Hour {
 			if n, err := refreshWetest(st); err != nil {
 				log.Printf("优选 IP 刷新失败: %v", err)
 			} else {

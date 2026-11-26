@@ -359,10 +359,12 @@ func installWS(st *State) {
 	ok("解析 %s → %s（CF 代理）", host, st.srvAddr())
 	wsRules(st, c)
 	ok("CF 回源规则：%s → 端口 %d，SSL 只对这个子域名用 Flexible", host, pub)
-	if n, err := refreshWetest(st); err != nil {
-		warn("优选 IP 拉取失败，先只用内置优选域名：%v", err)
-	} else {
-		ok("拉到 %d 个优选 IP", n)
+	if st.CFIP.fetches() {
+		if n, err := refreshWetest(st); err != nil {
+			warn("优选 IP 拉取失败：%v", err)
+		} else {
+			ok("拉到 %d 个优选 IP", n)
+		}
 	}
 	ok("CF WS 安装完成，新解析生效可能要一两分钟")
 }

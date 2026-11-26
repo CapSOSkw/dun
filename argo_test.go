@@ -11,7 +11,7 @@ import (
 func testArgoState() *State {
 	return &State{
 		Token: "tok123",
-		CFIP:  CFIPOpt{NoWetest: true, NoDomains: true},
+		CFIP:  CFIPOpt{NoTokyo: true},
 		Argo: &Argo{Host: "xh.example.com", Tunnel: "c1744f8b-faa1-48a4-9e5c-02ac921467fa",
 			Inner: 21001, Web: 21002, UUID: "11111111-2222-4333-8444-555555555555", Path: "/abc123xyz0"},
 	}
@@ -124,14 +124,21 @@ func TestArgoNodes(t *testing.T) {
 	}
 
 	// 优选地址每个出 TCP、UDP 两个，名字带 Argo- 前缀
-	st.CFIP = CFIPOpt{NoWetest: true}
+	// 默认只有内置东京 IP；wetest 和内置域名默认关
+	st.CFIP = CFIPOpt{}
 	ns = buildNodes(st)
-	if len(ns) != 2*(1+len(builtinDomains)) {
-		t.Fatalf("节点数 %d，应该是 %d", len(ns), 2*(1+len(builtinDomains)))
+	if len(ns) != 2*(1+len(tokyoIPs)) {
+		t.Fatalf("节点数 %d，应该是 %d", len(ns), 2*(1+len(tokyoIPs)))
 	}
-	if ns[2].name != "Argo-优选-"+builtinDomains[0] || ns[3].name != "Argo-优选-"+builtinDomains[0]+"-UDP" ||
-		!strings.Contains(ns[2].link, "@"+builtinDomains[0]+":443?") {
-		t.Fatalf("优选节点不对: %s / %s / %s", ns[2].name, ns[3].name, ns[2].link)
+	if ns[2].name != "Argo-东京-"+tokyoIPs[0] || ns[3].name != "Argo-东京-"+tokyoIPs[0]+"-UDP" ||
+		!strings.Contains(ns[2].link, "@"+tokyoIPs[0]+":443?") {
+		t.Fatalf("东京节点不对: %s / %s / %s", ns[2].name, ns[3].name, ns[2].link)
+	}
+
+	// 打开内置域名以后才有域名节点
+	st.CFIP = CFIPOpt{Domains: true}
+	if ns := buildNodes(st); len(ns) != 2*(1+len(tokyoIPs)+len(builtinDomains)) {
+		t.Fatalf("打开内置域名后节点数 %d", len(ns))
 	}
 }
 

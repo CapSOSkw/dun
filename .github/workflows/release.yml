@@ -20,7 +20,9 @@ jobs:
           for a in amd64 arm64; do
             CGO_ENABLED=0 GOOS=linux GOARCH=$a go build -trimpath -ldflags "-s -w -X main.version=$v -X main.repo=$GITHUB_REPOSITORY" -o dist/dun-linux-$a .
           done
-          sed "s#github.com/[^/]*/dun/releases#github.com/$GITHUB_REPOSITORY/releases#" install.sh > dist/install.sh
+          # install.sh 写死仓库和这次的 tag：从哪个版本拿的 install.sh，就装哪个版本
+          sed -e "s#^repo=.*#repo=\"$GITHUB_REPOSITORY\"#" -e "s#^tag=.*#tag=\"$GITHUB_REF_NAME\"#" install.sh > dist/install.sh
+          grep -q "^tag=\"$GITHUB_REF_NAME\"$" dist/install.sh
           (cd dist && sha256sum * > sha256sums.txt)
       - name: publish
         env:
