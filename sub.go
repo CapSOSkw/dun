@@ -230,10 +230,19 @@ var tokyoIPs = []string{
 	"172.64.52.178", "172.64.52.113", "172.64.229.218",
 }
 
-func cfAddrs(st *State) []CFAddr {
+// 普通橙云域名（CF WS 用的就是这种）在 108.162.198.x、172.64.52.x 上会被 CF 拒绝，返回 403 错误 1034；
+// 隧道域名（Argo）不受这个限制。实测东京段里普通域名只能用 172.64.229.x
+var tokyoWSIPs = []string{"172.64.229.218", "172.64.229.21"}
+
+// 优选地址池。argo 为 true 时给 Argo 用，否则给 CF WS 用：两边能用的东京 IP 不一样
+func cfAddrs(st *State, argo bool) []CFAddr {
 	var res []CFAddr
 	if !st.CFIP.NoTokyo {
-		for _, ip := range tokyoIPs {
+		ips := tokyoWSIPs
+		if argo {
+			ips = tokyoIPs
+		}
+		for _, ip := range ips {
 			res = append(res, CFAddr{Addr: ip, Port: 443, Name: "东京-" + ip})
 		}
 	}
@@ -331,7 +340,7 @@ func uniqName(seen map[string]int, s string) string {
 func argoNodes(st *State, base string) []node {
 	g := st.Argo
 	addrs := []CFAddr{{Addr: g.Host, Port: 443, Name: base + "-Argo"}}
-	for _, a := range cfAddrs(st) {
+	for _, a := range cfAddrs(st, true) {
 		a.Name = "Argo-" + a.Name
 		addrs = append(addrs, a)
 	}
@@ -425,7 +434,7 @@ func buildNodes(st *State) []node {
 	}
 	if st.WS != nil {
 		w := st.WS
-		addrs := append([]CFAddr{{Addr: w.Host, Port: 443, Name: base + "-CF-WS"}}, cfAddrs(st)...)
+		addrs := append([]CFAddr{{Addr: w.Host, Port: 443, Name: base + "-CF-WS"}}, cfAddrs(st, false)...)
 		seen := map[string]int{}
 		for _, a := range addrs {
 			a.Name = uniqName(seen, a.Name)

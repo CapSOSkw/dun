@@ -219,6 +219,28 @@ func TestConnectorPlace(t *testing.T) {
 	}
 }
 
+// 普通橙云域名在 108.162.198.x、172.64.52.x 上会被 CF 拒绝（1034），CF WS 只能用 172.64.229.x
+func TestWSUsesOnlyAllowedTokyoIPs(t *testing.T) {
+	st := testArgoState()
+	st.CFIP = CFIPOpt{}
+	st.WS = &WS{Host: "ws.example.com", UUID: "11111111-2222-4333-8444-555555555555", Path: "/p"}
+	argo, ws := 0, 0
+	for _, n := range buildNodes(st) {
+		switch {
+		case strings.Contains(n.link, "type=xhttp"):
+			argo++
+		case strings.Contains(n.link, "type=ws"):
+			ws++
+			if strings.Contains(n.link, "@108.162.198.") || strings.Contains(n.link, "@172.64.52.") {
+				t.Fatalf("CF WS 用了会被 1034 拒绝的 IP: %s", n.name)
+			}
+		}
+	}
+	if argo != 2*(1+len(tokyoIPs)) || ws != 1+len(tokyoWSIPs) {
+		t.Fatalf("Argo %d 个、CF WS %d 个", argo, ws)
+	}
+}
+
 func TestSubBasePrefersArgo(t *testing.T) {
 	st := testArgoState()
 	st.WS = &WS{Host: "ws.example.com"}

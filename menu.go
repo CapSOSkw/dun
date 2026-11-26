@@ -79,7 +79,7 @@ func showLinks(st *State) {
 		l := linkArgo(st, a, false)
 		b.WriteString("【Argo 隧道】VLESS + XHTTP，VPS 不开端口，IP 被墙也能用\n" + l + "\n")
 		qrs = append(qrs, l)
-		n := len(cfAddrs(st))
+		n := len(cfAddrs(st, true))
 		if !st.CFIP.NoH3 {
 			a.Name += "-UDP"
 			lu := linkArgo(st, a, true)
@@ -94,7 +94,7 @@ func showLinks(st *State) {
 	if st.WS != nil {
 		l := linkWS(st, CFAddr{Addr: st.WS.Host, Port: 443, Name: base + "-CF-WS"})
 		b.WriteString("【CF WS】走 Cloudflare，IP 被墙也能用\n" + l + "\n")
-		b.WriteString(fmt.Sprintf("订阅里另外带了 %d 个优选地址的 CF WS 节点\n\n", len(cfAddrs(st))))
+		b.WriteString(fmt.Sprintf("订阅里另外带了 %d 个优选地址的 CF WS 节点\n\n", len(cfAddrs(st, false))))
 		qrs = append(qrs, l)
 	}
 	if st.Hy2 != nil {
@@ -312,7 +312,8 @@ func cfipMenu(st *State) {
 		if !wc.Time.IsZero() {
 			upd = wc.Time.Local().Format("01-02 15:04")
 		}
-		fmt.Fprintf(os.Stderr, "  东京优选 IP（内置）：%s，%d 个   自选：%d 个\n", onoff(!st.CFIP.NoTokyo), len(tokyoIPs), len(customAddrs()))
+		fmt.Fprintf(os.Stderr, "  东京优选 IP（内置）：%s，Argo %d 个、CF WS %d 个   自选：%d 个\n",
+			onoff(!st.CFIP.NoTokyo), len(tokyoIPs), len(tokyoWSIPs), len(customAddrs()))
 		fmt.Fprintf(os.Stderr, "  wetest 三网优选 IP：%s，%d 个，更新于 %s\n", onoff(st.CFIP.Wetest), len(wc.Items), upd)
 		nd := len(builtinDomains)
 		if wc.Checked {
@@ -320,13 +321,12 @@ func cfipMenu(st *State) {
 		}
 		fmt.Fprintf(os.Stderr, "  内置优选域名：%s，%d/%d 个能用   IPv6 优选：%s\n",
 			onoff(st.CFIP.Domains), nd, len(builtinDomains), onoff(st.CFIP.V6))
-		n := len(cfAddrs(st)) + 1
 		var parts []string
 		if st.WS != nil {
-			parts = append(parts, fmt.Sprintf("CF WS %d 个", n))
+			parts = append(parts, fmt.Sprintf("CF WS %d 个", len(cfAddrs(st, false))+1))
 		}
 		if st.Argo != nil {
-			m := n
+			m := len(cfAddrs(st, true)) + 1
 			if !st.CFIP.NoH3 {
 				m *= 2
 			}
@@ -346,8 +346,17 @@ func cfipMenu(st *State) {
 				ok("拉到 %d 个优选 IP", n)
 			}
 		case 1:
-			for _, a := range cfAddrs(st) {
-				fmt.Printf("  %-42s %-5d %s\n", a.Addr, a.Port, a.Name)
+			if st.Argo != nil {
+				fmt.Println("  Argo 用的：")
+				for _, a := range cfAddrs(st, true) {
+					fmt.Printf("    %-42s %-5d %s\n", a.Addr, a.Port, a.Name)
+				}
+			}
+			if st.WS != nil {
+				fmt.Println("  CF WS 用的（东京段里普通橙云域名只能用 172.64.229.x）：")
+				for _, a := range cfAddrs(st, false) {
+					fmt.Printf("    %-42s %-5d %s\n", a.Addr, a.Port, a.Name)
+				}
 			}
 		case 2:
 			info("一行一个，格式：地址[:端口][#备注]，比如 104.16.1.1:2053#家里最快。空行结束")
