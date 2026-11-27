@@ -276,7 +276,7 @@ func renewLoop() {
 				log.Printf("证书续期失败，过几个小时再试: %v", err)
 			} else {
 				log.Printf("证书已续期")
-				if st.AnyTLS != nil || st.Hy2 != nil {
+				if st.certInBox() {
 					svcDo("restart", svcBox)
 				}
 			}

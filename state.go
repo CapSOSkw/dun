@@ -94,6 +94,22 @@ type Hy2 struct {
 	HopSec   int    `json:"hop_sec"`
 }
 
+// TUIC v5：单用户 uuid + 密码，不开 0-RTT（会被重放）
+type TUIC struct {
+	Port     int    `json:"port"` // UDP
+	PubPort  int    `json:"pub_port"`
+	UUID     string `json:"uuid"`
+	Password string `json:"password"`
+	CC       string `json:"cc"` // 拥塞控制，默认 bbr
+}
+
+func (t *TUIC) cc() string {
+	if t.CC == "" {
+		return "bbr"
+	}
+	return t.CC
+}
+
 type WS struct {
 	Host     string      `json:"host"`
 	RecordID string      `json:"record_id"`
@@ -154,6 +170,7 @@ type State struct {
 	AnyTLS   *AnyTLS  `json:"anytls,omitempty"`
 	WS       *WS      `json:"ws,omitempty"`
 	Hy2      *Hy2     `json:"hy2,omitempty"`
+	TUIC     *TUIC    `json:"tuic,omitempty"`
 	Argo     *Argo    `json:"argo,omitempty"`
 	Disguise Disguise `json:"disguise"`
 	Token    string   `json:"token,omitempty"`
@@ -178,11 +195,14 @@ func (s *State) save() {
 }
 
 func (s *State) installed() bool {
-	return s.Reality != nil || s.AnyTLS != nil || s.WS != nil || s.Hy2 != nil || s.Argo != nil
+	return s.Reality != nil || s.AnyTLS != nil || s.WS != nil || s.Hy2 != nil || s.TUIC != nil || s.Argo != nil
 }
 
 // 节点域名和证书被谁用着
-func (s *State) needTLS() bool { return s.Reality != nil || s.AnyTLS != nil || s.Hy2 != nil }
+func (s *State) needTLS() bool { return s.Reality != nil || s.certInBox() }
+
+// sing-box 自己加载证书文件的协议，续期后要重启 sing-box；Reality 的伪装站由 dun 每次握手现读
+func (s *State) certInBox() bool { return s.AnyTLS != nil || s.Hy2 != nil || s.TUIC != nil }
 
 func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	dir := filepath.Dir(path)

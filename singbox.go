@@ -140,6 +140,15 @@ func sbConfig(st *State) (map[string]any, int) {
 			"min_packet_size": h.MinPkt, "max_packet_size": h.MaxPkt}
 		inb = append(inb, in)
 	}
+	if t := st.TUIC; t != nil {
+		inb = append(inb, map[string]any{
+			"type": "tuic", "tag": "tuic", "listen": listenAll(), "listen_port": t.Port,
+			"users":              []any{map[string]any{"name": user, "uuid": t.UUID, "password": t.Password}},
+			"congestion_control": t.cc(), "zero_rtt_handshake": false,
+			"tls": map[string]any{"enabled": true, "server_name": st.TLS.Host, "alpn": []string{"h3"},
+				"certificate_path": certFile, "key_path": keyFile},
+		})
+	}
 	if w := st.WS; w != nil {
 		inb = append(inb, map[string]any{
 			"type": "vless", "tag": "ws", "listen": "127.0.0.1", "listen_port": w.Inner,
@@ -206,6 +215,13 @@ func applyAll(st *State) {
 	if st.Argo != nil {
 		want = append(want, st.Argo.Inner, st.Argo.Web)
 	}
+	var udp []int
+	if st.Hy2 != nil {
+		udp = append(udp, st.Hy2.Port)
+	}
+	if st.TUIC != nil {
+		udp = append(udp, st.TUIC.Port)
+	}
 	for i := 0; i < 20; i++ {
 		bad := 0
 		for _, p := range want {
@@ -213,8 +229,10 @@ func applyAll(st *State) {
 				bad = p
 			}
 		}
-		if st.Hy2 != nil && udpOwner(st.Hy2.Port) != "ours" {
-			bad = st.Hy2.Port
+		for _, p := range udp {
+			if udpOwner(p) != "ours" {
+				bad = p
+			}
 		}
 		if bad == 0 {
 			fwPrune(st)

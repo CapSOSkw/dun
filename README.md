@@ -1,6 +1,6 @@
 # dun 盾
 
-一条命令装好三种节点：Reality 偷自己、AnyTLS、套 Cloudflare 的 VLESS + WS；线路差的机器还可以加装 Hysteria2，或者装一条 Argo 隧道（VLESS + XHTTP），VPS 一个公网端口都不用开。装完输入 `dun` 就能管理。
+一条命令装好三种节点：Reality 偷自己、AnyTLS、套 Cloudflare 的 VLESS + WS；线路差的机器还可以加装 Hysteria2 和 TUIC v5，或者装一条 Argo 隧道（VLESS + XHTTP），VPS 一个公网端口都不用开。装完输入 `dun` 就能管理。
 
 dun 是一个 Go 写的单文件程序。节点由官方 sing-box 跑，Argo 的 XHTTP 由 Xray 跑、隧道由 cloudflared 跑，伪装站、订阅和证书续期由 dun 自己的后台服务负责。
 
@@ -33,7 +33,7 @@ dun
 不想进菜单也可以直接敲命令：
 
 ```bash
-dun install reality      # 只装一个，reality / anytls / ws / all / hy2 / argo
+dun install reality      # 只装一个，reality / anytls / ws / all / hy2 / tuic / argo
 dun links                # 再看一遍订阅和链接
 dun log                  # 看日志
 dun syncip               # 机器换了 IP 以后同步解析
@@ -85,16 +85,21 @@ v2rayN、Shadowrocket 用的 `/sub` 订阅装不下规则，用客户端自带�
 - **证书不暴露节点域名**：证书签成 `*.<随机>.<你的域名>`，证书公开日志里只有通配符，扫描器拿不到真正的节点域名。觉得域名被盯上了，`dun rehost` 一键换
 - **AnyTLS**：填充方案每台机器随机生成，不用官方默认那套
 - **Hysteria2**：gecko 混淆，握手包切成随机大小；端口跳跃的范围和间隔每台机器随机；没有密码的探测一律不回应
+- **TUIC v5**：不开 0-RTT，防重放；bbr 拥塞控制
 - **CF WS**：回源端口只回应 Cloudflare 的 IP，别人直连就是一个没开的端口；路径随机
 - **Argo 隧道**：VPS 不开公网端口，GFW 只看到你在连 Cloudflare；XHTTP 路径随机；隧道 token 只放在 root 能读的文件里，不出现在进程列表
 - **伪装站**：登录页每台机器随机生成，标题、文案、配色、页面结构、登录接口和报错都不一样
 - **客户端**：DNS 防泄露，分流规则
 
-## Hysteria2
+## Hysteria2 和 TUIC v5
 
-菜单第 5 项单独装，不在「三个一起装」里。走 UDP，丢包多、晚高峰拥堵的线路上明显比 TCP 协议快，适合线路不好的机器。
+菜单第 5 项「安装 HY2 | TUIC5」，不在「三个一起装」里。进去直接回车是两个一起装，也可以只装 HY2 或只装 TUIC5；已经装了的那个会跳过，原来的密码和端口不动。命令行是 `dun install hy2`、`dun install tuic`。两个都走 UDP，丢包多、晚高峰拥堵的线路上明显比 TCP 协议快，适合线路不好的机器。改端口、重置密码、卸载时两个是分开的两项，动一个不影响另一个。
 
-默认就是最抗封锁的配置：gecko 混淆、端口跳跃，参数每台机器随机，不用自己选。客户端要求 mihomo 1.19.34、sing-box 1.14 以上，老版本不认 gecko。云厂商的安全组记得放行 UDP。
+Hysteria2 默认就是最抗封锁的配置：gecko 混淆、端口跳跃，参数每台机器随机，不用自己选。客户端要求 mihomo 1.19.34、sing-box 1.14 以上，老版本不认 gecko。
+
+TUIC v5 和 Hy2 共用节点域名和证书，默认随机一个 20000-59999 的 UDP 端口，也可以自己填，填 443 也行（UDP 443 和 Reality 的 TCP 443 不冲突）。它的端口会自动避开 Hy2 的端口和整段跳跃范围，Hy2 选跳跃范围时也会避开它。客户端：Mihomo（Clash Verge Rev、FlClash）、v2rayN、Shadowrocket、Stash、sing-box 官方客户端（SFA）都能用；v2rayNG 稳定版的常规入口暂时没有 TUIC。
+
+云厂商的安全组（比如 Azure 的 NSG）要放行这两个协议的 UDP 端口，Hy2 还有跳跃范围。
 
 ## Argo 隧道
 
@@ -130,7 +135,7 @@ VPS 不开任何公网端口，也不暴露 IP，IP 被墙了照样能用；NAT 
 | 序号 | 功能 |
 |---|---|
 | 1-4 | 单独装某个协议，或者三个一起装 |
-| 5 | 装 Hysteria2 |
+| 5 | 装 HY2 / TUIC5：回车两个一起装，也可以只装一个 |
 | 6 | Argo 隧道：没装就装（可以新建隧道，也可以复用这台机器上已有的）；装了可以看状态、切换隧道协议、重启、卸载 |
 | 7 / 8 | 看订阅、链接和二维码，看 mihomo 配置 |
 | 9 | 优选地址：刷新、看列表、加自选、开关来源、开关 Argo 的 UDP 版、重置订阅地址 |
@@ -161,7 +166,7 @@ Argo 隧道也是保底，而且在很多线路上比 CF WS 快：CF WS 要 Clou
 
 只加这几样：
 
-- 两条解析。一条给 Reality、AnyTLS、Hysteria2 用，只解析不开代理；另一条给 CF WS 用，开橙云
+- 两条解析。一条给 Reality、AnyTLS、Hysteria2、TUIC 用，只解析不开代理；另一条给 CF WS 用，开橙云
 - CF WS 那个子域名一条回源规则，把 CF 回源的端口改成节点端口
 - CF WS 那个子域名一条配置规则，单独把 SSL 设成 Flexible，安全级别调低，免得订阅和连接被拦
 
@@ -201,9 +206,9 @@ sing-box 官方客户端、Clash Verge Rev、FlClash 这类 mihomo 内核的客�
 
 **NAT 小鸡能用吗？**
 
-能。网卡上看不到出口 IPv4 时，安装协议会问一次端口怎么分配。甲骨文、Azure 这类绑定了独享公网 IP 的实例，选 1，节点沿用监听端口，Hy2 可以跳端口。云安全组要放行监听端口和显示的 UDP 跳跃范围。
+能。网卡上看不到出口 IPv4 时，安装协议会问一次端口怎么分配。甲骨文、Azure 这类绑定了独享公网 IP 的实例，选 1，节点沿用监听端口，Hy2 可以跳端口。云安全组要放行监听端口、TUIC 的 UDP 端口和显示的 UDP 跳跃范围。
 
-如果服务商只给几个映射端口，选 2，再填分配给你的外网端口。即使内外端口号相同也选 2，Hy2 会走单端口。Argo 隧道不用开端口，NAT 机器装它最省事。
+如果服务商只给几个映射端口，选 2，再填分配给你的外网端口。即使内外端口号相同也选 2，Hy2 会走单端口。TUIC 本来就是单端口，同样填服务商分配的 UDP 外网端口。Argo 隧道不用开端口，NAT 机器装它最省事。
 
 旧版已经把 Hy2 装成单端口的，升级后进菜单 11，选 Hysteria2，保留监听端口，端口方式选 1。放行显示的 UDP 范围后刷新订阅即可。已经装好的 Reality、AnyTLS、CF WS 端口不受影响，升级后照旧。
 

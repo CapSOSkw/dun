@@ -416,6 +416,8 @@ func curPorts(st *State, key string) (int, int) {
 		return st.WS.Port, st.WS.PubPort
 	case key == "hy2" && st.Hy2 != nil:
 		return st.Hy2.Port, st.Hy2.PubPort
+	case key == "tuic" && st.TUIC != nil:
+		return st.TUIC.Port, st.TUIC.PubPort
 	}
 	return 0, 0
 }
@@ -453,7 +455,7 @@ func hasLocalIP(ip string, addrs []net.Addr) bool {
 }
 
 func (st *State) hasMappedPorts() bool {
-	for _, key := range []string{"reality", "anytls", "ws", "hy2"} {
+	for _, key := range []string{"reality", "anytls", "ws", "hy2", "tuic"} {
 		port, pub := curPorts(st, key)
 		if pub > 0 && pub != port {
 			return true
