@@ -453,7 +453,6 @@ func buildNodes(st *State) []node {
     congestion-controller: %s
     udp-relay-mode: native
     reduce-rtt: false
-    udp: true
 `, q(n), q(st.TLS.Host), t.PubPort, q(t.UUID), q(t.Password), q(st.TLS.Host), t.cc())})
 	}
 	if st.Argo != nil {

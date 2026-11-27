@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -285,21 +286,23 @@ func trimLog(p string, max, keep int64) {
 // ── 端口 ─────────────────────────────────────────────
 func listenInodes(port int) []string { return sockInodes(port, false) }
 
-// UDP 没有监听状态，未连接的套接字是 07
+var procNet = "/proc/net/" // 测试里指到临时目录
+
+// UDP 没有监听状态：未连接的套接字是 07，绑了端口再 connect 的是 01，都占着端口
 func sockInodes(port int, udp bool) []string {
-	files, state := []string{"/proc/net/tcp", "/proc/net/tcp6"}, "0A"
+	files, states := []string{"tcp", "tcp6"}, []string{"0A"}
 	if udp {
-		files, state = []string{"/proc/net/udp", "/proc/net/udp6"}, "07"
+		files, states = []string{"udp", "udp6"}, []string{"07", "01"}
 	}
 	var res []string
 	for _, f := range files {
-		b, err := os.ReadFile(f)
+		b, err := os.ReadFile(procNet + f)
 		if err != nil {
 			continue
 		}
 		for i, line := range strings.Split(string(b), "\n") {
 			fs := strings.Fields(line)
-			if i == 0 || len(fs) < 10 || fs[3] != state {
+			if i == 0 || len(fs) < 10 || !slices.Contains(states, fs[3]) {
 				continue
 			}
 			idx := strings.LastIndex(fs[1], ":")

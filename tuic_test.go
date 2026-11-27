@@ -388,3 +388,149 @@ func TestTUICIndependentManage(t *testing.T) {
 		t.Fatalf("卸载 Hy2 影响了 TUIC：%v", got)
 	}
 }
+
+// 映射端口时两个 UDP 协议的外网端口不能重，安装和改端口都走 askUDPPub；直连时不多问
+func TestUDPMappedPubExclusion(t *testing.T) {
+	st := tuicState()
+	st.PortMode = portMapped
+	st.Hy2.HopStart, st.Hy2.HopEnd, st.Hy2.PubPort, st.TUIC.PubPort = 0, 0, 30443, 30444
+	old := in
+	t.Cleanup(func() { in = old })
+	for _, tc := range []struct {
+		key, input string
+		port, want int
+	}{
+		{"tuic", "30443\n30445\n", 45000, 30445}, // TUIC 填了 Hy2 的外网端口
+		{"hy2", "30444\n30446\n", 5443, 30446},   // 反过来
+		{"tuic", "30444\n", 45000, 30444},        // 自己原来的外网端口照样能用
+	} {
+		in = bufio.NewReader(strings.NewReader(tc.input))
+		if got := askUDPPub(st, tc.key, tc.port); got != tc.want {
+			t.Fatalf("%s 外网端口 = %d，应为 %d", tc.key, got, tc.want)
+		}
+	}
+	st.PortMode = portDirect
+	in = nil // 直连不读输入，外网端口就是监听端口
+	if got := askUDPPub(st, "tuic", 30443); got != 30443 {
+		t.Fatalf("直连模式外网端口 = %d", got)
+	}
+}
+
+// 绑了端口再 connect 的 UDP 套接字（状态 01）也占着端口
+func TestUDPConnectedSocketBusy(t *testing.T) {
+	old := procNet
+	t.Cleanup(func() { procNet = old })
+	procNet = t.TempDir() + "/"
+	udp := "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n" +
+		"  1: 00000000:75BB 0100007F:0035 01 00000000:00000000 00:00000000 00000000     0        0 111 2 0000000000000000 0\n" +
+		"  2: 00000000:75BC 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 222 2 0000000000000000 0\n"
+	os.WriteFile(procNet+"udp", []byte(udp), 0644)
+	if got := sockInodes(30139, true); !reflect.DeepEqual(got, []string{"111"}) {
+		t.Fatalf("已连接的 UDP 套接字没认出来：%v", got)
+	}
+	if got := sockInodes(30140, true); !reflect.DeepEqual(got, []string{"222"}) {
+		t.Fatalf("未连接的 UDP 套接字没认出来：%v", got)
+	}
+	if sockInodes(30139, false) != nil || udpOwner(30139) == "" || udpOwner(30141) != "" {
+		t.Fatal("UDP 占用判断不对")
+	}
+	oldIn := in
+	t.Cleanup(func() { in = oldIn })
+	in = bufio.NewReader(strings.NewReader("30139\n30141\n"))
+	if p := askUDPPort(&State{}, "tuic", 30139); p != 30141 {
+		t.Fatalf("选了被已连接套接字占着的端口：%d", p)
+	}
+	if a, _ := freeUDPRange(39990); a != 0 { // 任何起点都盖住 30139
+		t.Fatal("跳跃范围盖住了已连接套接字的端口")
+	}
+}
+
+// CC 只认 sing-box 支持的三种，别的一律 bbr；Clash 的 TUIC 节点不带 Mihomo 没定义的 udp 键
+func TestTUICCCAndYAMLKeys(t *testing.T) {
+	for cc, want := range map[string]string{"": "bbr", "bbr": "bbr", "cubic": "cubic", "new_reno": "new_reno",
+		"BBR": "bbr", "reno": "bbr", "bbr\n    skip-cert-verify: true": "bbr"} {
+		st := tuicState()
+		st.Hy2 = nil
+		st.TUIC.CC = cc
+		c := subClash(st)
+		if st.TUIC.cc() != want || findInbound(t, st, "tuic")["congestion_control"] != want ||
+			!strings.Contains(linkTUIC(st, "x"), "congestion_control="+want+"&") ||
+			!strings.Contains(c, "    congestion-controller: "+want+"\n") || strings.Contains(c, "skip-cert-verify") {
+			t.Fatalf("CC %q 应当成 %q", cc, want)
+		}
+		if strings.Contains(c, "udp: true") {
+			t.Fatal("TUIC 节点不该有 udp 键")
+		}
+	}
+}
+
+func TestRenewRestarts(t *testing.T) {
+	for _, tc := range []struct {
+		st   State
+		want []string
+	}{
+		{State{TUIC: &TUIC{}}, []string{svcBox}},
+		{State{Hy2: &Hy2{}}, []string{svcBox}},
+		{State{AnyTLS: &AnyTLS{}}, []string{svcBox}},
+		{State{Reality: &Reality{}}, nil},
+		{State{}, nil},
+	} {
+		if got := renewRestarts(&tc.st); !reflect.DeepEqual(got, tc.want) {
+			t.Fatalf("%+v 续期后重启 %v，应为 %v", tc.st, got, tc.want)
+		}
+	}
+}
+
+// 首次安装：回车或 1 依次装 Hy2、TUIC，2 只装 Hy2，3 只装 TUIC
+func TestInstallUDPFresh(t *testing.T) {
+	var calls []string
+	oi, oin := udpInstallers, in
+	t.Cleanup(func() { udpInstallers, in = oi, oin })
+	udpInstallers = map[string]func(*State){
+		"hy2":  func(*State) { calls = append(calls, "hy2") },
+		"tuic": func(*State) { calls = append(calls, "tuic") },
+	}
+	for input, want := range map[string][]string{"\n": {"hy2", "tuic"}, "1\n": {"hy2", "tuic"}, "2\n": {"hy2"}, "3\n": {"tuic"}, "0\n": nil} {
+		calls = nil
+		in = bufio.NewReader(strings.NewReader(input))
+		captureStderr(func() { installUDP(&State{}) })
+		if !reflect.DeepEqual(calls, want) {
+			t.Fatalf("输入 %q 装了 %v，应为 %v", input, calls, want)
+		}
+	}
+}
+
+// 真走 removeTUIC / removeHy2：另一个协议的端口、跳跃范围、密码在内存和磁盘上都不变。
+// 测试里没有 sing-box，applyAll 在配置检查处 die（换成 panic）；之后的重启、等端口、回收规则要真服务，跑不了
+func TestRemoveOneUDPKeepsOther(t *testing.T) {
+	ob, oc, os_, oe := sbBin, sbConf, statePath, dieExit
+	t.Cleanup(func() { sbBin, sbConf, statePath, dieExit = ob, oc, os_, oe })
+	dir := t.TempDir()
+	sbBin, sbConf, statePath = dir+"/no-sing-box", dir+"/sing-box.json", dir+"/state.json"
+	dieExit = func(int) { panic("die") }
+	remove := func(f func(*State), st *State) {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("没有 sing-box 却没在配置检查处停下")
+			}
+		}()
+		captureStderr(func() { f(st) })
+	}
+
+	st := tuicState()
+	hy2 := *st.Hy2
+	remove(removeTUIC, st)
+	if disk := loadState(); st.TUIC != nil || disk.TUIC != nil || *st.Hy2 != hy2 || disk.Hy2 == nil || *disk.Hy2 != hy2 {
+		t.Fatal("卸载 TUIC 动了 Hy2，或者 TUIC 没删掉")
+	}
+	if _, n := sbConfig(st); n != 1 || findInbound(t, st, "hysteria2")["listen_port"] != 5443 {
+		t.Fatal("卸载 TUIC 后 sing-box 配置里的 Hy2 不对")
+	}
+
+	st = tuicState()
+	tuic := *st.TUIC
+	remove(removeHy2, st)
+	if disk := loadState(); st.Hy2 != nil || disk.Hy2 != nil || *st.TUIC != tuic || disk.TUIC == nil || *disk.TUIC != tuic {
+		t.Fatal("卸载 Hy2 动了 TUIC，或者 Hy2 没删掉")
+	}
+}

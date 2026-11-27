@@ -99,7 +99,9 @@ Hysteria2 默认就是最抗封锁的配置：gecko 混淆、端口跳跃，参�
 
 TUIC v5 和 Hy2 共用节点域名和证书，默认随机一个 20000-59999 的 UDP 端口，也可以自己填，填 443 也行（UDP 443 和 Reality 的 TCP 443 不冲突）。它的端口会自动避开 Hy2 的端口和整段跳跃范围，Hy2 选跳跃范围时也会避开它。客户端：Mihomo（Clash Verge Rev、FlClash）、v2rayN、Shadowrocket、Stash、sing-box 官方客户端（SFA）都能用；v2rayNG 稳定版的常规入口暂时没有 TUIC。
 
-云厂商的安全组（比如 Azure 的 NSG）要放行这两个协议的 UDP 端口，Hy2 还有跳跃范围。
+云厂商的安全组（比如 Azure 的 NSG）要放行这两个协议的 UDP 端口，Hy2 还有跳跃范围。映射端口时两个协议的外网端口也不能填成同一个。
+
+在线订阅（`/sub`、`/clash`）由 Reality 偷自己、CF WS 或 Argo 隧道的域名提供。只装了 Hy2 / TUIC 时没有在线订阅，用 `dun links` 看单个链接，用 `dun mihomo` 导出 Clash 配置；装了上面任意一个，Hy2 和 TUIC 节点会一起进订阅。
 
 ## Argo 隧道
 

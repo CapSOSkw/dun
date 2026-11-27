@@ -422,9 +422,9 @@ func freeUDPRange(width int, avoid ...int) (int, int) {
 	for _, p := range avoid {
 		busy[p] = true
 	}
-	for _, f := range []string{"/proc/net/udp", "/proc/net/udp6"} {
-		b, _ := os.ReadFile(f)
-		for i, line := range strings.Split(string(b), "\n") {
+	for _, f := range []string{"udp", "udp6"} {
+		b, _ := os.ReadFile(procNet + f)
+		for i, line := range strings.Split(string(b), "\n") { // 不看状态：未连接（07）和已连接（01）的都算占用
 			fs := strings.Fields(line)
 			if i == 0 || len(fs) < 4 {
 				continue
@@ -477,6 +477,21 @@ func askUDPPort(st *State, key string, def int) int {
 		}
 		return p
 	}
+}
+
+// 映射端口时公网 UDP 端口也不能重：两个协议的链接会指到同一个公网地址和端口。直连时外网端口就是监听端口，上面已经查过
+func askUDPPub(st *State, key string, port int) int {
+	for {
+		pub := askPubPort(st, port)
+		if st.PortMode != portMapped || !st.udpPubTaken(pub, key) {
+			return pub
+		}
+		warn("外网 UDP %d 已经分给本脚本的其他协议了，换一个", pub)
+	}
+}
+
+func (st *State) udpPubTaken(pub int, key string) bool {
+	return (st.Hy2 != nil && key != "hy2" && pub == st.Hy2.PubPort) || (st.TUIC != nil && key != "tuic" && pub == st.TUIC.PubPort)
 }
 
 func randUDPPort(st *State, key string) int {
@@ -543,7 +558,7 @@ func installHy2(st *State) {
 	hr()
 	info("安装 Hysteria2：gecko 混淆 + 端口跳跃，参数每台机器随机")
 	port := askUDPPort(st, "hy2", randUDPPort(st, "hy2"))
-	pub := askPubPort(st, port)
+	pub := askUDPPub(st, "hy2", port)
 	h := newHy2(port, pub)
 	setHy2Range(h, st.PortMode, st.tuicPorts()...)
 	tlsHostEnsure(st)
@@ -569,7 +584,7 @@ func installTUIC(st *State) {
 	hr()
 	info("安装 TUIC v5（QUIC），和 Hy2 共用节点域名和证书，端口各用各的")
 	port := askUDPPort(st, "tuic", randUDPPort(st, "tuic"))
-	pub := askPubPort(st, port)
+	pub := askUDPPub(st, "tuic", port)
 	tlsHostEnsure(st)
 	st.TUIC = &TUIC{Port: port, PubPort: pub, UUID: newUUID(), Password: randLabel(32), CC: "bbr"}
 	fwOpenProto(fmt.Sprint(port), "udp")
@@ -583,6 +598,8 @@ var udpChoices = []string{"一起安装 HY2 + TUIC5（默认，直接回车）",
 
 func udpPlan(i int) []string { return [][]string{{"hy2", "tuic"}, {"hy2"}, {"tuic"}}[i] }
 
+var udpInstallers = map[string]func(*State){"hy2": installHy2, "tuic": installTUIC} // 测试里换成记录调用的替身
+
 // 已经装了的那个由 installHy2 / installTUIC 自己提示跳过，凭据和端口不动
 func installUDP(st *State) {
 	i := choose(udpChoices, 1)
@@ -590,7 +607,7 @@ func installUDP(st *State) {
 		return
 	}
 	for _, k := range udpPlan(i) {
-		map[string]func(*State){"hy2": installHy2, "tuic": installTUIC}[k](st)
+		udpInstallers[k](st)
 	}
 }
 

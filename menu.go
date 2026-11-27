@@ -66,6 +66,8 @@ func showLinks(st *State) {
 		b.WriteString("【订阅】v2rayN / Shadowrocket / NekoBox / 小火箭\n" + base + "/sub\n\n")
 		b.WriteString("【订阅】Clash Verge / FlClash / mihomo\n" + base + "/clash\n\n")
 		qrs = append(qrs, base+"/sub")
+	} else {
+		b.WriteString("【订阅】没有在线订阅：它由 Reality 偷自己、CF WS 或 Argo 隧道的域名提供。只装 Hy2 / TUIC 时导入下面的单个链接，Clash 配置用 dun mihomo 导出\n\n")
 	}
 	base := nodeName()
 	if st.Reality != nil {
@@ -172,7 +174,11 @@ func changePort(st *State) {
 	if st.PortMode == portMapped && port == oldPort && oldPub > 0 {
 		pub = oldPub
 	}
-	pub = askPubPort(st, pub)
+	if k == "hy2" || k == "tuic" {
+		pub = askUDPPub(st, k, pub)
+	} else {
+		pub = askPubPort(st, pub)
+	}
 	switch k {
 	case "hy2":
 		st.Hy2.Port, st.Hy2.PubPort = port, pub

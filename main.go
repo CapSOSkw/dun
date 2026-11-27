@@ -289,8 +289,8 @@ func main() {
 		if err := issueCert(st, cfLogin()); err != nil {
 			die("续期失败：%v", err)
 		}
-		if st.certInBox() {
-			svcDo("restart", svcBox)
+		for _, s := range renewRestarts(st) {
+			svcDo("restart", s)
 		}
 		exp, _ := certExpiry()
 		ok("证书已更新，到期时间 %s", exp.Local().Format("2006-01-02"))

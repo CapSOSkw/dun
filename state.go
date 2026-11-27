@@ -103,11 +103,13 @@ type TUIC struct {
 	CC       string `json:"cc"` // 拥塞控制，默认 bbr
 }
 
+// 只认 sing-box 支持的三种，state 里的别的值一律当 bbr，免得写进配置和链接
 func (t *TUIC) cc() string {
-	if t.CC == "" {
-		return "bbr"
+	switch t.CC {
+	case "cubic", "new_reno", "bbr":
+		return t.CC
 	}
-	return t.CC
+	return "bbr"
 }
 
 type WS struct {
@@ -203,6 +205,14 @@ func (s *State) needTLS() bool { return s.Reality != nil || s.certInBox() }
 
 // sing-box 自己加载证书文件的协议，续期后要重启 sing-box；Reality 的伪装站由 dun 每次握手现读
 func (s *State) certInBox() bool { return s.AnyTLS != nil || s.Hy2 != nil || s.TUIC != nil }
+
+// 证书续期成功后要重启的服务，renewLoop 和 dun renew 共用
+func renewRestarts(st *State) []string {
+	if st.certInBox() {
+		return []string{svcBox}
+	}
+	return nil
+}
 
 func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	dir := filepath.Dir(path)
