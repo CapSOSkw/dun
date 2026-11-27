@@ -399,42 +399,6 @@ func askPubPort(st *State, p int) int {
 	return askInt("  这台像是 NAT 机器，外网端口是多少（甲骨文这类内外端口一样的直接回车）", p, 1, 65535)
 }
 
-func fwOpen(p int) { fwOpenProto(strconv.Itoa(p), "tcp") }
-
-// ps 可以是单个端口，也可以是 20000:21000 这样的范围
-func fwOpenProto(ps, proto string) {
-	p := ps
-	if have("ufw") {
-		if out, _ := runOut("ufw", "status"); strings.Contains(out, "Status: active") {
-			if run("ufw", "allow", ps+"/"+proto) == nil {
-				info("ufw 已放行 %s/%s", p, proto)
-			}
-		}
-	}
-	if have("firewall-cmd") && run("firewall-cmd", "--state") == nil {
-		run("firewall-cmd", "-q", "--permanent", "--add-port="+strings.ReplaceAll(ps, ":", "-")+"/"+proto)
-		run("firewall-cmd", "-q", "--reload")
-		info("firewalld 已放行 %s/%s", p, proto)
-	}
-	// 甲骨文 Ubuntu 镜像自带 iptables REJECT，不加这条外面连不进来
-	if have("iptables") {
-		out, _ := runOut("iptables", "-S", "INPUT")
-		if strings.Contains(out, "-j REJECT") || strings.Contains(out, "-j DROP") || strings.Contains(out, "-P INPUT DROP") {
-			if run("iptables", "-C", "INPUT", "-p", proto, "--dport", ps, "-j", "ACCEPT") != nil {
-				run("iptables", "-I", "INPUT", "-p", proto, "--dport", ps, "-j", "ACCEPT")
-			}
-			if have("netfilter-persistent") {
-				run("netfilter-persistent", "save")
-			} else if isDir("/etc/iptables") {
-				if b, err := exec.Command("iptables-save").Output(); err == nil {
-					os.WriteFile("/etc/iptables/rules.v4", b, 0640)
-				}
-			}
-			info("iptables 已放行 %s/%s", p, proto)
-		}
-	}
-}
-
 // ── 公网 IP ──────────────────────────────────────────
 func traceIP(network, u string) string {
 	tr := &http.Transport{DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {

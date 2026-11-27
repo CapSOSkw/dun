@@ -544,6 +544,7 @@ func uninstallAll(st *State) {
 	if initSys == "systemd" {
 		run("systemctl", "daemon-reload")
 	}
+	fwCleanup()
 	os.RemoveAll(baseDir)
 	os.Remove(selfPath)
 	ok("已全部卸载，BBR 设置保留")
