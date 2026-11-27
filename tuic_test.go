@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -423,8 +424,8 @@ func TestUDPMappedPubExclusion(t *testing.T) {
 
 // 输入已经结束（没有终端、stdin 读完）时，默认值冲突不能死循环，要退出
 func TestUDPPortEOFNoLoop(t *testing.T) {
-	oe, oi := dieExit, in
-	t.Cleanup(func() { dieExit, in = oe, oi })
+	oe, oi, os_ := dieExit, in, os.Stderr
+	t.Cleanup(func() { dieExit, in, os.Stderr, eofIn = oe, oi, os_, nil }) // 超时时死循环的 goroutine 还占着重定向
 	dieExit = func(int) { panic("die") }
 	mapped, direct := tuicState(), tuicState()
 	for _, st := range []*State{mapped, direct} {
@@ -447,6 +448,9 @@ func TestUDPPortEOFNoLoop(t *testing.T) {
 		case r := <-done:
 			if r != "die" {
 				t.Fatalf("%s：输入结束后应该 die，得到 %v", name, r)
+			}
+			if os.Stderr != os_ {
+				t.Fatalf("%s：die 之后 os.Stderr 没还原", name)
 			}
 		case <-time.After(3 * time.Second):
 			t.Fatalf("%s：输入结束后死循环", name)
@@ -486,24 +490,104 @@ func TestFreeUDPRangeSocketStates(t *testing.T) {
 }
 
 // 同一端口上外部进程的已连接套接字（01）排在自家 sing-box 的监听（07）前面：归属还是自家，就绪检查不误报
+// 占用归属（分配端口用，01 也算）和就绪（applyAll 用，只认自家的 07）分开判断。
+// 外部进程是 pid 100，排在自家 sing-box（pid 200）前面
 func TestUDPOwnerPrefersOurs(t *testing.T) {
-	dir := fakeProc(t, udpLine("01", "111")+udpLine("07", "222"))
-	proc := func(pid, inode, cmdline, comm string) {
-		os.MkdirAll(dir+"/"+pid+"/fd", 0755)
-		os.WriteFile(dir+"/"+pid+"/cmdline", []byte(cmdline), 0644)
-		os.WriteFile(dir+"/"+pid+"/comm", []byte(comm+"\n"), 0644)
-		if err := os.Symlink("socket:["+inode+"]", dir+"/"+pid+"/fd/3"); err != nil {
-			t.Skip("建不了符号链接：", err)
+	ours, nc := sbBin+"\x00run\x00-c\x00"+sbConf, "nc\x00-u\x00-p\x0030139"
+	for _, tc := range []struct {
+		name, ext, own, owner string
+		ready                 bool
+	}{
+		{"外部 01 + 自家 07", "01", "07", "ours", true},
+		{"只有自家 07", "", "07", "ours", true},
+		{"只有自家 01：connect 过，没在监听", "", "01", "ours", false},
+		{"外部 07 + 自家 01", "07", "01", "ours", false},
+		{"只有外部 01", "01", "", "nc", false},
+	} {
+		lines := ""
+		if tc.ext != "" {
+			lines += udpLine(tc.ext, "111")
+		}
+		if tc.own != "" {
+			lines += udpLine(tc.own, "222")
+		}
+		dir := fakeProc(t, lines)
+		if tc.ext != "" {
+			fakeProcess(t, dir, "100", "111", nc, "nc")
+		}
+		if tc.own != "" {
+			fakeProcess(t, dir, "200", "222", ours, "sing-box")
+		}
+		if o, r := udpOwner(30139), udpListening(30139); o != tc.owner || r != tc.ready {
+			t.Fatalf("%s：归属 %q、就绪 %v，应为 %q、%v", tc.name, o, r, tc.owner, tc.ready)
 		}
 	}
-	proc("100", "111", "nc\x00-u\x00-p\x0030139", "nc")
-	proc("200", "222", sbBin+"\x00run\x00-c\x00"+sbConf, "sing-box")
-	if o := udpOwner(30139); o != "ours" {
-		t.Fatalf("自家 sing-box 在监听，归属却是 %q", o)
+}
+
+// 假 /proc 里的一个进程，fd/3 指向 inode 这个套接字
+func fakeProcess(t *testing.T, dir, pid, inode, cmdline, comm string) {
+	os.MkdirAll(dir+"/"+pid+"/fd", 0755)
+	os.WriteFile(dir+"/"+pid+"/cmdline", []byte(cmdline), 0644)
+	os.WriteFile(dir+"/"+pid+"/comm", []byte(comm+"\n"), 0644)
+	if err := os.Symlink("socket:["+inode+"]", dir+"/"+pid+"/fd/3"); err != nil {
+		t.Skip("建不了符号链接：", err)
 	}
-	os.Remove(dir + "/200/fd/3")
-	if o := udpOwner(30139); o != "nc" {
-		t.Fatalf("只剩外部进程时归属应为 nc，得到 %q", o)
+}
+
+// 读一次 EOF（终端里按 Ctrl+D）之后又能读到内容，像交互终端那样
+type eofOnce struct {
+	hit bool
+	r   io.Reader
+}
+
+func (e *eofOnce) Read(p []byte) (int, error) {
+	if !e.hit {
+		e.hit = true
+		return 0, io.EOF
+	}
+	return e.r.Read(p)
+}
+
+// 按过一次 Ctrl+D 接受默认值，后面输错了要照常重问，不能因为那次 EOF 直接退出
+func TestEOFOnceThenRetry(t *testing.T) {
+	oe, oi := dieExit, in
+	t.Cleanup(func() { dieExit, in, eofIn = oe, oi, nil })
+	dieExit = func(int) { panic("die") }
+	in = bufio.NewReader(&eofOnce{r: strings.NewReader("70000\n123\n5443\n46000\n")})
+	var a, b, p int
+	captureStderr(func() {
+		a = askInt("a", 5, 1, 65535)               // Ctrl+D：默认值
+		b = askInt("b", 5, 1, 65535)               // 70000 不合法，重问后 123
+		p = askUDPPort(tuicState(), "tuic", 45000) // 5443 是 Hy2 的，重问后 46000
+	})
+	if a != 5 || b != 123 || p != 46000 {
+		t.Fatalf("得到 %d %d %d", a, b, p)
+	}
+}
+
+// 算 Hy2 跳跃范围时 TUIC 的外网端口也要避开：TUIC 45000→30444（映射时装的），Hy2 改端口时切到了直连
+func TestHy2RangeAvoidsTUICPubPort(t *testing.T) {
+	// 监听端口 1000 不在任何候选范围里，只有外网端口 30444 能让它找不到
+	st := &State{TUIC: &TUIC{Port: 1000, PubPort: 30444}}
+	if got := st.tuicPorts(); !reflect.DeepEqual(got, []int{1000, 30444}) {
+		t.Fatalf("tuicPorts = %v", got)
+	}
+	if a, _ := freeUDPRange(39990, st.tuicPorts()...); a != 0 { // 任何起点都盖住 30444
+		t.Fatal("跳跃范围盖住了 TUIC 的外网端口")
+	}
+	oldHop := hopUsable
+	t.Cleanup(func() { hopUsable = oldHop })
+	hopUsable = func() bool { return true }
+	st = tuicState()
+	st.TUIC.PubPort = 30444
+	for i := 0; i < 300; i++ {
+		h := &Hy2{Port: 5443}
+		setHy2Range(h, portDirect, st.tuicPorts()...)
+		for _, p := range []int{45000, 30444} {
+			if h.HopStart <= p && p <= h.HopEnd {
+				t.Fatalf("跳跃范围 %d-%d 盖住了 TUIC 的 %d", h.HopStart, h.HopEnd, p)
+			}
+		}
 	}
 }
 

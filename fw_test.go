@@ -229,15 +229,20 @@ func TestFwPrune(t *testing.T) {
 	}
 }
 
-func captureStderr(f func()) string {
+// f panic（比如 die 换成的 panic）也要还原 os.Stderr、关掉管道；边写边读，输出多了也不会卡住
+func captureStderr(f func()) (out string) {
 	r, w, _ := os.Pipe()
 	old := os.Stderr
 	os.Stderr = w
+	got := make(chan string)
+	go func() { b, _ := io.ReadAll(r); r.Close(); got <- string(b) }()
+	defer func() {
+		os.Stderr = old
+		w.Close()
+		out = <-got
+	}()
 	f()
-	w.Close()
-	os.Stderr = old
-	b, _ := io.ReadAll(r)
-	return string(b)
+	return
 }
 
 // 实时规则读不到（-S 失败）：要提示，开机文件里的陈旧规则照样清

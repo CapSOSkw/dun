@@ -288,11 +288,17 @@ func listenInodes(port int) []string { return sockInodes(port, false) }
 
 var procDir = "/proc" // 测试里指到临时目录
 
-// UDP 没有监听状态：未连接的套接字是 07，绑了端口再 connect 的是 01，都占着端口
-func sockInodes(port int, udp bool) []string {
-	files, states := []string{"tcp", "tcp6"}, []string{"0A"}
+// UDP 没有监听状态：未连接的套接字是 07，绑了端口再 connect 的是 01，都占着端口。states 不填就是这两种（TCP 是 0A）
+func sockInodes(port int, udp bool, states ...string) []string {
+	files := []string{"tcp", "tcp6"}
 	if udp {
-		files, states = []string{"udp", "udp6"}, []string{"07", "01"}
+		files = []string{"udp", "udp6"}
+	}
+	if len(states) == 0 {
+		states = []string{"0A"}
+		if udp {
+			states = []string{"07", "01"}
+		}
 	}
 	var res []string
 	for _, f := range files {
@@ -318,6 +324,12 @@ func sockInodes(port int, udp bool) []string {
 func portOwner(port int) string { return sockOwner(port, false) }
 func udpOwner(port int) string  { return sockOwner(port, true) }
 
+// applyAll 的就绪检查：本脚本的进程在这个 UDP 端口上真的在收包（07）。自家已连接的 01 不算，和 v1.2.0 一样
+func udpListening(port int) bool {
+	inodes := sockInodes(port, true, "07")
+	return len(inodes) > 0 && inodeOwner(inodes) == "ours"
+}
+
 func sockOwner(port int, udp bool) string {
 	inodes := sockInodes(port, udp)
 	if len(inodes) == 0 {
@@ -333,6 +345,10 @@ func sockOwner(port int, udp bool) string {
 		}
 		return ""
 	}
+	return inodeOwner(inodes)
+}
+
+func inodeOwner(inodes []string) string {
 	want := map[string]bool{}
 	for _, i := range inodes {
 		want["socket:["+i+"]"] = true

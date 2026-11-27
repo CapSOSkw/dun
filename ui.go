@@ -43,6 +43,7 @@ func ask(prompt, def string) string {
 	} else {
 		fmt.Fprintf(os.Stderr, "%s: ", prompt)
 	}
+	eofIn = nil // 只记这一次有没有读到头：终端里按过一次 Ctrl+D，后面照样能输入
 	s, err := in.ReadString('\n')
 	s = strings.TrimSpace(s)
 	if err != nil && s == "" {
@@ -91,9 +92,9 @@ func askInt(prompt string, def, min, max int) int {
 	}
 }
 
-var eofIn *bufio.Reader // 读到头的输入；测试会换 in，所以记的是哪个 reader 读完了
+var eofIn *bufio.Reader // 上一次 ask 读到头的输入；测试会换 in，所以记的是哪个 reader
 
-// 输入校验不过要重问。输入已经结束（没有终端、stdin 读完）时 ask 只会一直给同一个默认值，直接退出，别死循环
+// 输入校验不过要重问。上一次读输入就读到了头（没有终端、stdin 读完）时 ask 只会一直给同一个默认值，直接退出，别死循环
 func reask(f string, a ...any) {
 	warn(f, a...)
 	if in != nil && eofIn == in {

@@ -230,7 +230,7 @@ func applyAll(st *State) {
 			}
 		}
 		for _, p := range udp {
-			if udpOwner(p) != "ours" {
+			if !udpListening(p) {
 				bad = p
 			}
 		}

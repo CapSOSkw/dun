@@ -456,12 +456,12 @@ func (st *State) udpTaken(p int, key string) bool {
 	return st.TUIC != nil && key != "tuic" && p == st.TUIC.Port
 }
 
-// 已装 TUIC 的端口，算 Hy2 跳跃范围时要避开
+// 已装 TUIC 的监听端口和外网端口，算 Hy2 跳跃范围时都要避开：端口方式从映射切到直连后，TUIC 可能还留着映射的外网端口
 func (st *State) tuicPorts() []int {
 	if st.TUIC == nil {
 		return nil
 	}
-	return []int{st.TUIC.Port}
+	return []int{st.TUIC.Port, st.TUIC.PubPort}
 }
 
 func askUDPPort(st *State, key string, def int) int {
