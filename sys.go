@@ -327,7 +327,7 @@ func udpOwner(port int) string  { return sockOwner(port, true) }
 // applyAll 的就绪检查：本脚本的进程在这个 UDP 端口上真的在收包（07）。自家已连接的 01 不算，和 v1.2.0 一样
 func udpListening(port int) bool {
 	inodes := sockInodes(port, true, "07")
-	return len(inodes) > 0 && inodeOwner(inodes) == "ours"
+	return len(inodes) > 0 && inodeOwner(inodes, true) == "ours"
 }
 
 func sockOwner(port int, udp bool) string {
@@ -345,15 +345,16 @@ func sockOwner(port int, udp bool) string {
 		}
 		return ""
 	}
-	return inodeOwner(inodes)
+	return inodeOwner(inodes, udp)
 }
 
-func inodeOwner(inodes []string) string {
+// 找出持有这些套接字的进程。TCP 和 v1.2.0 一样认第一个匹配的进程；
+// UDP（preferOurs）同一端口可能还挂着别的进程的已连接套接字，只要有一个是自家的就算 ours，别让排在前面的外部进程盖过去
+func inodeOwner(inodes []string, preferOurs bool) string {
 	want := map[string]bool{}
 	for _, i := range inodes {
 		want["socket:["+i+"]"] = true
 	}
-	// 同一端口可能还挂着别的进程已连接的 UDP 套接字：只要有一个是自家的就算 ours，别让排在前面的外部进程盖过去
 	other := ""
 	procs, _ := os.ReadDir(procDir)
 	for _, p := range procs {
@@ -375,8 +376,15 @@ func inodeOwner(inodes []string) string {
 			if strings.Contains(c, sbConf) || strings.Contains(c, xrayConf) || strings.HasSuffix(c, "dun serve") {
 				return "ours"
 			}
-			if comm, _ := os.ReadFile(dir + "/comm"); other == "" && len(strings.TrimSpace(string(comm))) > 0 {
-				other = strings.TrimSpace(string(comm))
+			name := "未知进程"
+			if comm, _ := os.ReadFile(dir + "/comm"); len(strings.TrimSpace(string(comm))) > 0 {
+				name = strings.TrimSpace(string(comm))
+			}
+			if !preferOurs {
+				return name
+			}
+			if other == "" {
+				other = name
 			}
 		}
 	}

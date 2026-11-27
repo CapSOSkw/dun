@@ -11,7 +11,6 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-	"time"
 )
 
 func tuicState() *State {
@@ -424,8 +423,8 @@ func TestUDPMappedPubExclusion(t *testing.T) {
 
 // 输入已经结束（没有终端、stdin 读完）时，默认值冲突不能死循环，要退出
 func TestUDPPortEOFNoLoop(t *testing.T) {
-	oe, oi, os_ := dieExit, in, os.Stderr
-	t.Cleanup(func() { dieExit, in, os.Stderr, eofIn = oe, oi, os_, nil }) // 超时时死循环的 goroutine 还占着重定向
+	oe, oi, oo, os_ := dieExit, in, eofIn, os.Stderr
+	t.Cleanup(func() { dieExit, in, eofIn, os.Stderr = oe, oi, oo, os_ })
 	dieExit = func(int) { panic("die") }
 	mapped, direct := tuicState(), tuicState()
 	for _, st := range []*State{mapped, direct} {
@@ -438,24 +437,30 @@ func TestUDPPortEOFNoLoop(t *testing.T) {
 		"监听端口撞 Hy2":   func() { askUDPPort(mapped, "tuic", 5443) },
 		"数字不在范围里":     func() { askInt("x", 0, 1, 65535) },
 	} {
-		in = bufio.NewReader(strings.NewReader(""))
-		done := make(chan any, 1)
-		go func() {
-			defer func() { done <- recover() }()
-			captureStderr(f)
-		}()
-		select {
-		case r := <-done:
-			if r != "die" {
-				t.Fatalf("%s：输入结束后应该 die，得到 %v", name, r)
-			}
-			if os.Stderr != os_ {
-				t.Fatalf("%s：die 之后 os.Stderr 没还原", name)
-			}
-		case <-time.After(3 * time.Second):
-			t.Fatalf("%s：输入结束后死循环", name)
+		// 同一个 goroutine 里跑：一直读到 EOF 的输入读到第 50 次就 panic，真回归成死循环也会确定地停下
+		in = bufio.NewReader(&endlessEOF{})
+		var r any
+		captureStderr(func() {
+			defer func() { r = recover() }()
+			f()
+		})
+		if r != "die" {
+			t.Fatalf("%s：输入结束后应该 die，得到 %v", name, r)
+		}
+		if os.Stderr != os_ {
+			t.Fatalf("%s：die 之后 os.Stderr 没还原", name)
 		}
 	}
+}
+
+// 永远读到 EOF 的输入；被读太多次说明掉进了死循环
+type endlessEOF struct{ n int }
+
+func (e *endlessEOF) Read([]byte) (int, error) {
+	if e.n++; e.n > 50 {
+		panic("输入结束后死循环")
+	}
+	return 0, io.EOF
 }
 
 // 换一个假的 /proc，udp 是 /proc/net/udp 的内容
@@ -524,6 +529,24 @@ func TestUDPOwnerPrefersOurs(t *testing.T) {
 	}
 }
 
+// TCP 归属和 v1.2.0 一样认第一个匹配的进程：外部进程（pid 100）绑 127.0.0.2:30139、自家（pid 200）绑 127.0.0.1:30139，
+// 结果是外部进程。自家优先只用在 UDP：同样两个进程各有一个 07，UDP 归属是 ours
+func TestTCPOwnerFirstMatch(t *testing.T) {
+	dir := fakeProc(t, udpLine("07", "111")+udpLine("07", "222"))
+	tcp := func(addr, inode string) string {
+		return "  1: " + addr + ":75BB 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 " + inode + " 1 0000000000000000 100 0 0 10 0\n"
+	}
+	os.WriteFile(dir+"/net/tcp", []byte(udpHead+tcp("0200007F", "111")+tcp("0100007F", "222")), 0644)
+	fakeProcess(t, dir, "100", "111", "nginx", "nginx")
+	fakeProcess(t, dir, "200", "222", sbBin+"\x00run\x00-c\x00"+sbConf, "sing-box")
+	if o := portOwner(30139); o != "nginx" {
+		t.Fatalf("TCP 应认第一个匹配的进程 nginx，得到 %q", o)
+	}
+	if o := udpOwner(30139); o != "ours" {
+		t.Fatalf("UDP 应自家优先，得到 %q", o)
+	}
+}
+
 // 假 /proc 里的一个进程，fd/3 指向 inode 这个套接字
 func fakeProcess(t *testing.T, dir, pid, inode, cmdline, comm string) {
 	os.MkdirAll(dir+"/"+pid+"/fd", 0755)
@@ -550,8 +573,8 @@ func (e *eofOnce) Read(p []byte) (int, error) {
 
 // 按过一次 Ctrl+D 接受默认值，后面输错了要照常重问，不能因为那次 EOF 直接退出
 func TestEOFOnceThenRetry(t *testing.T) {
-	oe, oi := dieExit, in
-	t.Cleanup(func() { dieExit, in, eofIn = oe, oi, nil })
+	oe, oi, oo := dieExit, in, eofIn
+	t.Cleanup(func() { dieExit, in, eofIn = oe, oi, oo })
 	dieExit = func(int) { panic("die") }
 	in = bufio.NewReader(&eofOnce{r: strings.NewReader("70000\n123\n5443\n46000\n")})
 	var a, b, p int
@@ -567,6 +590,7 @@ func TestEOFOnceThenRetry(t *testing.T) {
 
 // 算 Hy2 跳跃范围时 TUIC 的外网端口也要避开：TUIC 45000→30444（映射时装的），Hy2 改端口时切到了直连
 func TestHy2RangeAvoidsTUICPubPort(t *testing.T) {
+	fakeProc(t, "") // 空的 /proc：机器上别的 UDP 套接字掩盖不了 freeUDPRange 忽略 avoid 的回归
 	// 监听端口 1000 不在任何候选范围里，只有外网端口 30444 能让它找不到
 	st := &State{TUIC: &TUIC{Port: 1000, PubPort: 30444}}
 	if got := st.tuicPorts(); !reflect.DeepEqual(got, []int{1000, 30444}) {
