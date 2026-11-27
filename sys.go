@@ -362,29 +362,30 @@ func randPort(st *State, avoid ...int) int {
 	return 0
 }
 
-func curPort(st *State, key string) int {
+func curPorts(st *State, key string) (int, int) {
 	switch {
 	case key == "reality" && st.Reality != nil:
-		return st.Reality.Port
+		return st.Reality.Port, st.Reality.PubPort
 	case key == "anytls" && st.AnyTLS != nil:
-		return st.AnyTLS.Port
+		return st.AnyTLS.Port, st.AnyTLS.PubPort
 	case key == "ws" && st.WS != nil:
-		return st.WS.Port
+		return st.WS.Port, st.WS.PubPort
 	case key == "hy2" && st.Hy2 != nil:
-		return st.Hy2.Port
+		return st.Hy2.Port, st.Hy2.PubPort
 	}
-	return 0
+	return 0, 0
 }
 
 func askPort(st *State, prompt string, def int, key string) int {
 	used := st.usedPorts(key)
+	current, _ := curPorts(st, key)
 	for {
 		p := askInt(prompt, def, 1, 65535)
 		if _, u := used[p]; u {
 			warn("%d 已经分给本脚本的其他协议了", p)
 			continue
 		}
-		if o := portOwner(p); o != "" && o != "ours" && p != curPort(st, key) {
+		if o := portOwner(p); o != "" && o != "ours" && p != current {
 			warn("%d 被 %s 占用，换一个", p, o)
 			continue
 		}
@@ -392,11 +393,58 @@ func askPort(st *State, prompt string, def int, key string) int {
 	}
 }
 
-func askPubPort(st *State, p int) int {
-	if !st.NAT {
-		return p
+const (
+	portDirect = "direct"
+	portMapped = "mapped"
+)
+
+func hasLocalIP(ip string, addrs []net.Addr) bool {
+	want := net.ParseIP(ip)
+	for _, a := range addrs {
+		if n, ok := a.(*net.IPNet); ok && want.Equal(n.IP) {
+			return true
+		}
 	}
-	return askInt("  这台像是 NAT 机器，外网端口是多少（甲骨文这类内外端口一样的直接回车）", p, 1, 65535)
+	return false
+}
+
+func (st *State) hasMappedPorts() bool {
+	for _, key := range []string{"reality", "anytls", "ws", "hy2"} {
+		port, pub := curPorts(st, key)
+		if pub > 0 && pub != port {
+			return true
+		}
+	}
+	return false
+}
+
+func selectPortMode(st *State, addrs []net.Addr) string {
+	mapped := st.hasMappedPorts()
+	if !mapped && st.PortMode != portMapped && (st.IP4 == "" || hasLocalIP(st.IP4, addrs)) {
+		return portDirect
+	}
+	def := 1
+	if st.PortMode == portMapped || (st.PortMode == "" && mapped) {
+		def = 2
+	}
+	info("请选择服务商给这台机器分配端口的方式")
+	info("1. 独享公网 IP，可以自行开放端口，比如绑定公网 IP 的甲骨文实例")
+	info("2. 只能用服务商分配的映射端口，包括内外端口号相同的情况")
+	if askInt("端口方式", def, 1, 2) == 2 {
+		return portMapped
+	}
+	return portDirect
+}
+
+func askPubPort(st *State, p int) int {
+	if st.PortMode != portDirect && st.PortMode != portMapped {
+		addrs, _ := net.InterfaceAddrs()
+		st.PortMode = selectPortMode(st, addrs)
+	}
+	if st.PortMode == portMapped {
+		return askInt("  服务商分配的外网端口", p, 1, 65535)
+	}
+	return p
 }
 
 // ── 公网 IP ──────────────────────────────────────────
@@ -421,20 +469,14 @@ func traceIP(network, u string) string {
 }
 
 func detectIP(st *State) {
+	oldIP4 := st.IP4
 	st.IP4 = traceIP("tcp4", "https://1.1.1.1/cdn-cgi/trace")
 	st.IP6 = traceIP("tcp6", "https://[2606:4700:4700::1111]/cdn-cgi/trace")
 	if st.IP4 == "" && st.IP6 == "" {
 		die("拿不到公网 IP，检查网络")
 	}
-	st.NAT = false
-	if st.IP4 != "" {
-		st.NAT = true
-		addrs, _ := net.InterfaceAddrs()
-		for _, a := range addrs {
-			if n, ok := a.(*net.IPNet); ok && n.IP.String() == st.IP4 {
-				st.NAT = false
-			}
-		}
+	if oldIP4 != st.IP4 {
+		st.PortMode = ""
 	}
 	st.save()
 }

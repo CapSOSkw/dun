@@ -476,6 +476,15 @@ func newHy2(port, pub int) *Hy2 {
 	return h
 }
 
+func setHy2Range(h *Hy2, mode string) {
+	if mode == portMapped {
+		h.HopStart, h.HopEnd = 0, 0
+		info("使用服务商分配的 UDP 端口，Hy2 走单端口")
+	} else if h.HopStart == 0 {
+		h.HopStart, h.HopEnd = freeUDPRange(r2(2000, 6000))
+	}
+}
+
 func installHy2(st *State) {
 	if st.Hy2 != nil {
 		warn("Hysteria2 已经装过了，改端口、换密码走管理菜单")
@@ -486,11 +495,7 @@ func installHy2(st *State) {
 	port := askUDPPort(st, randUDPPort())
 	pub := askPubPort(st, port)
 	h := newHy2(port, pub)
-	if st.NAT {
-		info("NAT 机器开不了端口跳跃，用单端口")
-	} else if a, b := freeUDPRange(r2(2000, 6000)); a > 0 {
-		h.HopStart, h.HopEnd = a, b
-	}
+	setHy2Range(h, st.PortMode)
 	tlsHostEnsure(st)
 	st.Hy2 = h
 	fwOpenProto(fmt.Sprint(port), "udp")
