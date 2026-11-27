@@ -187,7 +187,7 @@ func sbInstall(ver string) {
 		}
 		break
 	}
-	placeBin(sbBin, "sing-box", sbVersionAt)
+	placeBin(sbBin, svcBox, "sing-box", sbVersionAt)
 	ok("sing-box %s", sbVersion())
 }
 

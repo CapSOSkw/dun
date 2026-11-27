@@ -62,8 +62,13 @@ func restartCheck(svc string, wait time.Duration) error {
 }
 
 // 新文件先放在 .new，自己能跑才换上去，跑不起来就删掉，原来的不动；
-// 换上去以后跑不起来就换回旧的。旧的留成 .old，更新后服务起不来时回退用
-func placeBin(bin, name string, ver func(string) string) {
+// 换上去以后跑不起来就换回旧的。旧的留成 .old，更新后服务起不来时回退用。
+// 已经有 .old（上次失败留下的备份）就不换，免得把它覆盖掉；菜单更新和启动时的自动补装都走这里
+func placeBin(bin, svc, name string, ver func(string) string) {
+	if old, err := present(bin + ".old"); old || err != nil {
+		os.Remove(bin + ".new")
+		die("%s.old 是上次留下的备份（或者查不了: %v），这次不换 %s。手动处理：%s；确认现在的能用：rm %s.old", bin, err, name, restoreCmd(bin, svc), bin)
+	}
 	if ver(bin+".new") == "" {
 		os.Remove(bin + ".new")
 		die("新下载的 %s 跑不起来，原来的没动", name)
@@ -205,7 +210,7 @@ func xrayInstall(ver string) {
 		os.Remove(xrayBin + ".new")
 		die("Xray 包解不开: %v", err)
 	}
-	placeBin(xrayBin, "Xray", xrayVersionAt)
+	placeBin(xrayBin, svcXray, "Xray", xrayVersionAt)
 	ok("Xray %s", xrayVersion())
 }
 
@@ -221,7 +226,7 @@ func cfdInstall(ver string) {
 	if err := dlVerified("cloudflare/cloudflared", ver, "cloudflared-linux-"+runtime.GOARCH, cfdBin+".new", 0755); err != nil {
 		die("cloudflared 下载失败: %v", err)
 	}
-	placeBin(cfdBin, "cloudflared", cfdVersionAt)
+	placeBin(cfdBin, svcArgo, "cloudflared", cfdVersionAt)
 	ok("cloudflared %s", cfdVersion())
 }
 

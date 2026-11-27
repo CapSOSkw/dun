@@ -488,7 +488,7 @@ func TestPlaceBinKeepsOld(t *testing.T) {
 			var died bool
 			captureStderr(func() {
 				defer func() { died = recover() != nil }()
-				placeBin(bin, "sing-box", sbVersionAt) // sbInstall 走的就是这条
+				placeBin(bin, svcBox, "sing-box", sbVersionAt) // sbInstall 走的就是这条
 			})
 			assertBytes(t, "内核", bin, []byte(tc.want))
 			assertBytes(t, ".new", bin+".new", nil)
@@ -519,7 +519,7 @@ func TestPlaceBinFreshFail(t *testing.T) {
 	}
 	captureStderr(func() {
 		defer func() { recover() }()
-		placeBin(bin, "Xray", xrayVersionAt)
+		placeBin(bin, svcXray, "Xray", xrayVersionAt)
 	})
 	assertBytes(t, "内核", bin, nil)
 	assertBytes(t, ".new", bin+".new", nil)
@@ -1046,5 +1046,38 @@ func TestUpdateCfdDanglingBin(t *testing.T) {
 	}
 	if r.has("systemctl restart dun-argo") != 2 {
 		t.Fatalf("回退后应该再重启一次：%q", r.cmds)
+	}
+}
+
+// 启动时自动补装：正式 cloudflared 是悬空链接、.old 是上次留下的好备份。placeBin 不能把备份覆盖掉：
+// die，.old 还是原内容，bin 的链接不变，不留 .new
+func TestEnsureBinsKeepsOld(t *testing.T) {
+	isolatePaths(t)
+	fakeInstall(t)
+	os.MkdirAll(filepath.Dir(cfdBin), 0755)
+	target := filepath.Join(t.TempDir(), "gone")
+	if err := os.Symlink(target, cfdBin); err != nil {
+		t.Skipf("建不了符号链接：%v", err)
+	}
+	os.WriteFile(cfdBin+".old", []byte("LAST-GOOD"), 0755)
+	os.WriteFile(xrayBin, []byte("XRAY"), 0755) // Xray 在，只补 cloudflared
+	oout := runOut
+	t.Cleanup(func() { runOut = oout })
+	runOut = func(string, ...string) (string, error) { return "cloudflared version 2026.11.2", nil }
+	dlVerified = func(repo, tag, name, dst string, mode os.FileMode) error {
+		return os.WriteFile(dst, []byte("NEW"), mode)
+	}
+	var died bool
+	out := captureStderr(func() {
+		defer func() { died = recover() != nil }()
+		ensureArgoBins(true)
+	})
+	if !died || !strings.Contains(out, "这次不换") {
+		t.Fatalf("有 .old 时应该停下：\n%s", out)
+	}
+	assertBytes(t, ".old", cfdBin+".old", []byte("LAST-GOOD"))
+	assertBytes(t, ".new", cfdBin+".new", nil)
+	if got, err := os.Readlink(cfdBin); err != nil || got != target {
+		t.Fatalf("bin 的链接变了：%q %v", got, err)
 	}
 }
