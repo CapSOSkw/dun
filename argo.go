@@ -91,29 +91,46 @@ func placeBin(bin, name string, ver func(string) string) {
 	}
 }
 
-// 更新前删掉上次留下的 .old，返回原来有没有装。原来没有时回退不能拿别的 .old 顶上
-func prepOld(bin string) bool {
-	if err := os.Remove(bin + ".old"); err != nil && !os.IsNotExist(err) {
+// 手动把 .old 换回去的命令；bin 是目录时也能用
+func restoreCmd(bin, svc string) string {
+	restart := "systemctl restart " + svc
+	if initSys != "systemd" {
+		restart = "rc-service " + svc + " restart"
+	}
+	return fmt.Sprintf("rm -rf %s && mv %s.old %s && %s", bin, bin, bin, restart)
+}
+
+// 更新前处理上次留下的 .old，返回原来有没有装。
+// 现在的能跑才删 .old；现在的跑不起来又有 .old，说明上次没恢复完，先别更新，免得把唯一能用的旧版本删掉
+func prepOld(bin, svc string, ver func(string) string) bool {
+	if !exists(bin + ".old") {
+		return exists(bin)
+	}
+	if ver(bin) == "" {
+		die("%s 跑不起来，%s.old 是上次留下的旧版本，先恢复再更新：%s", bin, bin, restoreCmd(bin, svc))
+	}
+	if err := os.Remove(bin + ".old"); err != nil {
 		die("删不掉上次留下的 %s.old，没更新: %v", bin, err)
 	}
-	return exists(bin)
+	return true
 }
 
 // 测试里换掉，不真等
 var sleep = time.Sleep
 
-// 更新后服务起不来：换回 .old 再重启。原来没有装、或者换不回去时不重启，免得再起一次坏的
+// 更新后服务起不来：换回 .old 再重启。原来没有装就把新的删掉，不留在正式路径上；
+// 换不回去时不重启，免得再起一次坏的
 func rollbackBin(bin, svc string, had bool) {
 	if !had {
-		warn("原来没有装 %s，没有旧版本可回退", bin)
+		if err := os.Remove(bin); err != nil {
+			warn("原来没有装 %s，新装的也删不掉: %v，手动删掉它", bin, err)
+			return
+		}
+		warn("原来没有装 %s，新装的跑不起来，已删掉", bin)
 		return
 	}
 	if err := os.Rename(bin+".old", bin); err != nil {
-		restart := "systemctl restart " + svc
-		if initSys != "systemd" {
-			restart = "rc-service " + svc + " restart"
-		}
-		warn("换回旧版本失败: %v。%s 没有重启，手动恢复：mv %s.old %s && %s", err, svc, bin, bin, restart)
+		warn("换回旧版本失败: %v。%s 没有重启，手动恢复：%s", err, svc, restoreCmd(bin, svc))
 		return
 	}
 	if err := svcDo("restart", svc); err != nil {
@@ -230,7 +247,7 @@ func xrayConfig(st *State) map[string]any {
 	}
 }
 
-func svcExists(name string) bool {
+var svcExists = func(name string) bool { // 测试里换掉
 	return exists("/etc/systemd/system/"+name+".service") || exists("/etc/init.d/"+name)
 }
 
@@ -310,7 +327,13 @@ func zoneAccount(st *State, c *CF) (string, error) {
 	acc, err := c.ZoneAccount(st.Zone.ID)
 	if err == nil {
 		st.Zone.Account = acc
-		st.save()
+		// 只把账户 ID 写回磁盘，别把调用者还没应用的改动（比如刚换的 Argo UUID、路径）提前存进去
+		if cur, rerr := readState(); rerr == nil && cur.Zone != nil && cur.Zone.ID == st.Zone.ID {
+			cur.Zone.Account = acc
+			if werr := cur.write(); werr != nil {
+				warn("CF 账户 ID 没存上，下次用到时再查: %v", werr)
+			}
+		}
 	}
 	return acc, err
 }
@@ -869,14 +892,10 @@ func removeArgo(st *State) {
 		!confirm("没有能用的 CF 账号，CF 上的解析、隧道和规则删不掉，得自己去后台删。还是继续卸载？", false) {
 		return
 	}
-	// 卸掉 Argo 后的新配置先检查，不过就退出，服务和 CF 上都还没动
-	next := *st
-	next.Argo = nil
-	applyCheck(&next)
-	// 再停隧道（隧道上还挂着连接就删不掉），CF 上清理完再改状态，中途断了还能重来
-	for _, s := range []string{svcArgo, svcXray} {
-		svcDisable(s)
-	}
+	// 先按卸掉 Argo 的状态应用：预检不过什么都不动；停 Xray 和隧道（隧道上还挂着连接就删不掉）
+	// 在 applyAll 可回滚的阶段里做，失败会换回原来的配置、把服务起回来。成功后再清 CF 上的东西
+	st.Argo = nil
+	applyAll(st)
 	if c != nil && st.Zone != nil {
 		zid := st.Zone.ID
 		c.RuleRemove(zid, "http_config_settings", argoPrefix+a.Host)
@@ -907,8 +926,6 @@ func removeArgo(st *State) {
 		}
 		ok("已清理 %s 的解析、路由和 CF 规则", a.Host)
 	}
-	st.Argo = nil
-	applyAll(st)
 	os.Remove(argoToken)
 	if st.WS == nil {
 		os.Remove(wetestPath)
@@ -1011,7 +1028,7 @@ func updateXray() {
 	if ver == "" {
 		return
 	}
-	had := prepOld(xrayBin)
+	had := prepOld(xrayBin, svcXray, xrayVersionAt)
 	xrayInstall(ver)
 	out, err := runOut(xrayBin, "run", "-test", "-c", xrayConf)
 	if err == nil {
@@ -1032,7 +1049,7 @@ func updateCfd() {
 	if ver == "" {
 		return
 	}
-	had := prepOld(cfdBin)
+	had := prepOld(cfdBin, svcArgo, cfdVersionAt)
 	cfdInstall(ver)
 	if err := restartCheck(svcArgo, 3*time.Second); err != nil {
 		warn("新版本 cloudflared 跑不起来，回退到 %s: %v", cur, err)

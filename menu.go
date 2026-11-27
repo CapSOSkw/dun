@@ -507,7 +507,7 @@ func updateSingBox(st *State) {
 	if ver == "" {
 		return
 	}
-	had := prepOld(sbBin)
+	had := prepOld(sbBin, svcBox, sbVersionAt)
 	sbInstall(ver)
 	if _, n := sbConfig(st); n > 0 {
 		out, err := runOut(sbBin, "check", "-c", sbConf)

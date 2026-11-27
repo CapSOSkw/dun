@@ -115,16 +115,34 @@ func pickVersion(name, cur, pinned, latest string) string {
 	}
 	add(pinned, "推荐版本")
 	add(latest, "最新正式版")
-	n, err := strconv.Atoi(ask("装哪个（回车不更新）", "0"))
-	if err != nil || n < 1 || n > len(vers) {
+	a, full := askLine("装哪个（回车不更新）")
+	n, err := strconv.Atoi(a)
+	if !full || err != nil || n < 1 || n > len(vers) {
 		info("不更新 %s", name)
 		return ""
 	}
 	v := vers[n-1]
-	if vcmp(v, cur) < 0 && !confirm(fmt.Sprintf("%s 会从 %s 降级到 %s，确定？", name, show, v), false) {
-		return ""
+	if vcmp(v, cur) < 0 {
+		a, full = askLine(fmt.Sprintf("%s 会从 %s 降级到 %s，确定？(y/n) [n]", name, show, v))
+		if a = strings.ToLower(a); !full || (a != "y" && a != "yes") {
+			info("不更新 %s", name)
+			return ""
+		}
 	}
 	return v
+}
+
+// 菜单 15 专用：读一整行；没读到换行（读到头、只有半行）返回 false，调用者当作取消
+func askLine(prompt string) (string, bool) {
+	fmt.Fprintf(os.Stderr, "%s: ", prompt)
+	s, err := in.ReadString('\n')
+	eofIn = nil
+	if err != nil {
+		eofIn = in
+		fmt.Fprintln(os.Stderr)
+		return "", false
+	}
+	return strings.TrimSpace(s), true
 }
 
 func sbInstall(ver string) {
@@ -420,10 +438,16 @@ func startServices(st *State, xrChanged, rollback bool) error {
 		add(svcEnable(svcBox), "sing-box 设不了开机启动")
 		add(svcDo("restart", svcBox), "sing-box 服务起不来")
 	}
-	if err := applyHop(st); err != nil {
-		if rollback {
-			add(err, "按原来的配置加端口跳跃")
-		} else {
+	// 正向应用时清旧规则出错只提示（有的容器列不出 nat 表，以前也不管）；回滚时如实汇总
+	clearErr, addErr := applyHop(st)
+	if rollback {
+		add(clearErr, "清掉新的端口跳跃规则")
+		add(addErr, "按原来的配置加端口跳跃")
+	} else {
+		if clearErr != nil {
+			warn("清旧的端口跳跃规则出错: %v", clearErr)
+		}
+		if addErr != nil {
 			add(hopOff(st), "关掉端口跳跃")
 		}
 	}
@@ -470,35 +494,48 @@ func applyRollback(old []fileSnap, xrChanged bool) error {
 // 把一段 UDP 端口转到 hy2 端口上；dun 服务启动时会重新加一遍，重启机器也不丢
 const hopTag = "dun-hy2"
 
-func hopClear() {
+// 删掉 dun 加的跳跃规则；列不出、删不掉的都返回
+func hopClear() error {
+	var errs []error
 	for _, bin := range []string{"iptables", "ip6tables"} {
 		if !fwHave(bin) {
 			continue
 		}
-		out, _ := fwOut(bin, "-t", "nat", "-S", "PREROUTING")
+		out, err := fwOut(bin, "-t", "nat", "-S", "PREROUTING")
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s 列不出 nat 规则: %v", bin, err))
+			continue
+		}
 		for _, l := range strings.Split(out, "\n") {
 			if strings.HasPrefix(l, "-A ") && strings.Contains(l, hopTag) {
-				fwCmd(bin, append([]string{"-t", "nat", "-D"}, strings.Fields(l)[1:]...)...)
+				if err := fwCmd(bin, append([]string{"-t", "nat", "-D"}, strings.Fields(l)[1:]...)...); err != nil {
+					errs = append(errs, fmt.Errorf("%s 删不掉 %s: %v", bin, l, err))
+				}
 			}
 		}
 	}
+	return errors.Join(errs...)
 }
 
 // 服务启动时用：规则加不上就关掉跳跃并写回状态
 func hopApply(st *State) {
-	if hopRules(st) != nil {
+	clearErr, addErr := hopRules(st)
+	if clearErr != nil {
+		warn("清旧的端口跳跃规则出错: %v", clearErr)
+	}
+	if addErr != nil {
 		if err := hopOff(st); err != nil {
 			die("%v", err)
 		}
 	}
 }
 
-// 按 st 重加跳跃规则，加不上返回 error，不碰状态文件
-func hopRules(st *State) error {
-	hopClear()
+// 先清掉旧规则，再按 st 加跳跃规则；两步的错误分开返回，不碰状态文件
+func hopRules(st *State) (clearErr, addErr error) {
+	clearErr = hopClear()
 	h := st.Hy2
 	if h == nil || h.HopStart == 0 {
-		return nil
+		return clearErr, nil
 	}
 	rng := fmt.Sprintf("%d:%d", h.HopStart, h.HopEnd)
 	// 纯 IPv6 的机器得 ip6tables 加上才算数
@@ -511,9 +548,9 @@ func hopRules(st *State) error {
 		}
 	}
 	if !added {
-		return fmt.Errorf("端口跳跃规则 %s 加不上", rng)
+		return clearErr, fmt.Errorf("端口跳跃规则 %s 加不上", rng)
 	}
-	return nil
+	return clearErr, nil
 }
 
 // 跳跃规则加不上：关掉跳跃写回状态，所有进程（订阅、dun links、dun mihomo）都不再发跳不过去的范围。

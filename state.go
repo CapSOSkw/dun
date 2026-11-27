@@ -188,13 +188,18 @@ func loadState() *State {
 	return st
 }
 
-// 和 loadState 一样，出错返回 error 不退出
+// 和 loadState 一样，出错返回 error 不退出。文件不存在 = 还没装，返回空状态；读不了、解析不了都是错误
 func readState() (*State, error) {
 	st := &State{}
-	if b, err := os.ReadFile(statePath); err == nil {
-		if err := json.Unmarshal(b, st); err != nil {
-			return nil, fmt.Errorf("状态文件 %s 损坏: %v", statePath, err)
-		}
+	b, err := os.ReadFile(statePath)
+	if os.IsNotExist(err) {
+		return st, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("读不了状态文件 %s: %v", statePath, err)
+	}
+	if err := json.Unmarshal(b, st); err != nil {
+		return nil, fmt.Errorf("状态文件 %s 损坏: %v", statePath, err)
 	}
 	return st, nil
 }

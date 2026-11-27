@@ -198,14 +198,16 @@ func svcEnable(name string) error {
 	return nil
 }
 
-// 停掉并取消开机启动；本来就停着的不算失败
+// 停掉并取消开机启动。OpenRC 下 stop 报错时，只有 status 明确说 stopped 才算本来就停着
 func svcDisable(name string) error {
 	if initSys == "systemd" {
 		return run("systemctl", "disable", "--now", name)
 	}
 	var errs []error
-	if err := run("rc-service", name, "stop"); err != nil && svcActive(name) {
-		errs = append(errs, err)
+	if err := run("rc-service", name, "stop"); err != nil {
+		if out, _ := runOut("rc-service", name, "status"); !strings.Contains(out, "stopped") {
+			errs = append(errs, err)
+		}
 	}
 	if err := run("rc-update", "del", name, "default"); err != nil && exists("/etc/runlevels/default/"+name) {
 		errs = append(errs, err)
