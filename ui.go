@@ -46,6 +46,7 @@ func ask(prompt, def string) string {
 	s, err := in.ReadString('\n')
 	s = strings.TrimSpace(s)
 	if err != nil && s == "" {
+		eofIn = in
 		fmt.Fprintln(os.Stderr)
 		if def != "" {
 			return def
@@ -86,7 +87,17 @@ func askInt(prompt string, def, min, max int) int {
 		if err == nil && v >= min && v <= max {
 			return v
 		}
-		warn("请输入 %d-%d 之间的数字", min, max)
+		reask("请输入 %d-%d 之间的数字", min, max)
+	}
+}
+
+var eofIn *bufio.Reader // 读到头的输入；测试会换 in，所以记的是哪个 reader 读完了
+
+// 输入校验不过要重问。输入已经结束（没有终端、stdin 读完）时 ask 只会一直给同一个默认值，直接退出，别死循环
+func reask(f string, a ...any) {
+	warn(f, a...)
+	if in != nil && eofIn == in {
+		die("输入已结束，已取消")
 	}
 }
 

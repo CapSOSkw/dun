@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func tuicState() *State {
@@ -389,42 +390,126 @@ func TestTUICIndependentManage(t *testing.T) {
 	}
 }
 
-// 映射端口时两个 UDP 协议的外网端口不能重，安装和改端口都走 askUDPPub；直连时不多问
+// 两个 UDP 协议的外网端口不能重，安装和改端口都走 askUDPPub。
+// 状态里是 Hy2 5443→30443、TUIC 45000→30444（映射时装的），之后端口方式可能被切到直连
 func TestUDPMappedPubExclusion(t *testing.T) {
 	st := tuicState()
-	st.PortMode = portMapped
 	st.Hy2.HopStart, st.Hy2.HopEnd, st.Hy2.PubPort, st.TUIC.PubPort = 0, 0, 30443, 30444
 	old := in
 	t.Cleanup(func() { in = old })
 	for _, tc := range []struct {
-		key, input string
-		port, want int
+		mode, key, input       string
+		port, def, wPort, wPub int
 	}{
-		{"tuic", "30443\n30445\n", 45000, 30445}, // TUIC 填了 Hy2 的外网端口
-		{"hy2", "30444\n30446\n", 5443, 30446},   // 反过来
-		{"tuic", "30444\n", 45000, 30444},        // 自己原来的外网端口照样能用
+		{portMapped, "tuic", "30443\n30445\n", 45000, 45000, 45000, 30445}, // TUIC 填了 Hy2 的外网端口
+		{portMapped, "tuic", "5443\n30447\n", 45000, 45000, 45000, 30447},  // 也不能填 Hy2 的监听端口
+		{portMapped, "hy2", "30444\n30446\n", 5443, 5443, 5443, 30446},     // 反过来
+		{portMapped, "tuic", "30444\n", 45000, 30444, 45000, 30444},        // 自己原来的外网端口照样能用
+		// 切到直连后外网端口就是监听端口：撞了对方留着的外网端口，要换监听端口
+		{portDirect, "tuic", "30445\n", 30443, 30443, 30445, 30445},
+		{portDirect, "hy2", "30446\n", 30444, 30444, 30446, 30446},
 	} {
+		st.PortMode = tc.mode
 		in = bufio.NewReader(strings.NewReader(tc.input))
-		if got := askUDPPub(st, tc.key, tc.port); got != tc.want {
-			t.Fatalf("%s 外网端口 = %d，应为 %d", tc.key, got, tc.want)
+		if p, pub := askUDPPub(st, tc.key, tc.port, tc.def); p != tc.wPort || pub != tc.wPub {
+			t.Fatalf("%s %s 得到 %d→%d，应为 %d→%d", tc.mode, tc.key, p, pub, tc.wPort, tc.wPub)
 		}
 	}
-	st.PortMode = portDirect
-	in = nil // 直连不读输入，外网端口就是监听端口
-	if got := askUDPPub(st, "tuic", 30443); got != 30443 {
-		t.Fatalf("直连模式外网端口 = %d", got)
+	in = nil // 直连、不冲突时不读输入
+	if p, pub := askUDPPub(st, "tuic", 31000, 31000); p != 31000 || pub != 31000 {
+		t.Fatalf("直连模式 %d→%d", p, pub)
+	}
+}
+
+// 输入已经结束（没有终端、stdin 读完）时，默认值冲突不能死循环，要退出
+func TestUDPPortEOFNoLoop(t *testing.T) {
+	oe, oi := dieExit, in
+	t.Cleanup(func() { dieExit, in = oe, oi })
+	dieExit = func(int) { panic("die") }
+	mapped, direct := tuicState(), tuicState()
+	for _, st := range []*State{mapped, direct} {
+		st.Hy2.HopStart, st.Hy2.HopEnd, st.Hy2.PubPort = 0, 0, 30443
+	}
+	mapped.PortMode, direct.PortMode = portMapped, portDirect
+	for name, f := range map[string]func(){
+		"映射外网端口撞 Hy2": func() { askUDPPub(mapped, "tuic", 45000, 30443) },
+		"直连外网端口撞 Hy2": func() { askUDPPub(direct, "tuic", 30443, 30443) },
+		"监听端口撞 Hy2":   func() { askUDPPort(mapped, "tuic", 5443) },
+		"数字不在范围里":     func() { askInt("x", 0, 1, 65535) },
+	} {
+		in = bufio.NewReader(strings.NewReader(""))
+		done := make(chan any, 1)
+		go func() {
+			defer func() { done <- recover() }()
+			captureStderr(f)
+		}()
+		select {
+		case r := <-done:
+			if r != "die" {
+				t.Fatalf("%s：输入结束后应该 die，得到 %v", name, r)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("%s：输入结束后死循环", name)
+		}
+	}
+}
+
+// 换一个假的 /proc，udp 是 /proc/net/udp 的内容
+func fakeProc(t *testing.T, udp string) string {
+	old := procDir
+	t.Cleanup(func() { procDir = old })
+	procDir = t.TempDir()
+	os.MkdirAll(procDir+"/net", 0755)
+	os.WriteFile(procDir+"/net/udp", []byte(udpHead+udp), 0644)
+	return procDir
+}
+
+const udpHead = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n"
+
+// /proc/net/udp 的一行：端口 30139（75BB），st 是状态，07 未连接、01 已连接
+func udpLine(st, inode string) string {
+	return "  1: 00000000:75BB 0100007F:0035 " + st + " 00000000:00000000 00:00000000 00000000     0        0 " + inode + " 2 0000000000000000 0\n"
+}
+
+// 跳跃范围要避开已连接（01）和未连接（07）的 UDP 套接字，分开测，只漏一种也能发现
+func TestFreeUDPRangeSocketStates(t *testing.T) {
+	fakeProc(t, "")
+	if a, _ := freeUDPRange(39990); a == 0 {
+		t.Fatal("没有套接字时应该找得到")
+	}
+	for _, s := range []string{"01", "07"} {
+		fakeProc(t, udpLine(s, "111"))
+		if a, _ := freeUDPRange(39990); a != 0 { // 任何起点都盖住 30139
+			t.Fatalf("跳跃范围盖住了状态 %s 的套接字占着的端口", s)
+		}
+	}
+}
+
+// 同一端口上外部进程的已连接套接字（01）排在自家 sing-box 的监听（07）前面：归属还是自家，就绪检查不误报
+func TestUDPOwnerPrefersOurs(t *testing.T) {
+	dir := fakeProc(t, udpLine("01", "111")+udpLine("07", "222"))
+	proc := func(pid, inode, cmdline, comm string) {
+		os.MkdirAll(dir+"/"+pid+"/fd", 0755)
+		os.WriteFile(dir+"/"+pid+"/cmdline", []byte(cmdline), 0644)
+		os.WriteFile(dir+"/"+pid+"/comm", []byte(comm+"\n"), 0644)
+		if err := os.Symlink("socket:["+inode+"]", dir+"/"+pid+"/fd/3"); err != nil {
+			t.Skip("建不了符号链接：", err)
+		}
+	}
+	proc("100", "111", "nc\x00-u\x00-p\x0030139", "nc")
+	proc("200", "222", sbBin+"\x00run\x00-c\x00"+sbConf, "sing-box")
+	if o := udpOwner(30139); o != "ours" {
+		t.Fatalf("自家 sing-box 在监听，归属却是 %q", o)
+	}
+	os.Remove(dir + "/200/fd/3")
+	if o := udpOwner(30139); o != "nc" {
+		t.Fatalf("只剩外部进程时归属应为 nc，得到 %q", o)
 	}
 }
 
 // 绑了端口再 connect 的 UDP 套接字（状态 01）也占着端口
 func TestUDPConnectedSocketBusy(t *testing.T) {
-	old := procNet
-	t.Cleanup(func() { procNet = old })
-	procNet = t.TempDir() + "/"
-	udp := "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n" +
-		"  1: 00000000:75BB 0100007F:0035 01 00000000:00000000 00:00000000 00000000     0        0 111 2 0000000000000000 0\n" +
-		"  2: 00000000:75BC 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 222 2 0000000000000000 0\n"
-	os.WriteFile(procNet+"udp", []byte(udp), 0644)
+	fakeProc(t, udpLine("01", "111")+strings.Replace(udpLine("07", "222"), ":75BB", ":75BC", 1))
 	if got := sockInodes(30139, true); !reflect.DeepEqual(got, []string{"111"}) {
 		t.Fatalf("已连接的 UDP 套接字没认出来：%v", got)
 	}
@@ -439,9 +524,6 @@ func TestUDPConnectedSocketBusy(t *testing.T) {
 	in = bufio.NewReader(strings.NewReader("30139\n30141\n"))
 	if p := askUDPPort(&State{}, "tuic", 30139); p != 30141 {
 		t.Fatalf("选了被已连接套接字占着的端口：%d", p)
-	}
-	if a, _ := freeUDPRange(39990); a != 0 { // 任何起点都盖住 30139
-		t.Fatal("跳跃范围盖住了已连接套接字的端口")
 	}
 }
 
@@ -458,8 +540,9 @@ func TestTUICCCAndYAMLKeys(t *testing.T) {
 			!strings.Contains(c, "    congestion-controller: "+want+"\n") || strings.Contains(c, "skip-cert-verify") {
 			t.Fatalf("CC %q 应当成 %q", cc, want)
 		}
-		if strings.Contains(c, "udp: true") {
-			t.Fatal("TUIC 节点不该有 udp 键")
+		node := c[strings.Index(c, "    type: tuic\n"):]
+		if node = node[:strings.Index(node, "\nproxy-groups:")]; strings.Contains(node, "\n    udp:") {
+			t.Fatalf("TUIC 节点不该有 udp 键：\n%s", node)
 		}
 	}
 }
@@ -509,12 +592,14 @@ func TestRemoveOneUDPKeepsOther(t *testing.T) {
 	sbBin, sbConf, statePath = dir+"/no-sing-box", dir+"/sing-box.json", dir+"/state.json"
 	dieExit = func(int) { panic("die") }
 	remove := func(f func(*State), st *State) {
-		defer func() {
-			if recover() == nil {
-				t.Fatal("没有 sing-box 却没在配置检查处停下")
-			}
-		}()
-		captureStderr(func() { f(st) })
+		var r any
+		out := captureStderr(func() {
+			defer func() { r = recover() }()
+			f(st)
+		})
+		if r == nil || !strings.Contains(out, "sing-box 配置检查不通过") {
+			t.Fatalf("应该停在 sing-box 配置检查处：%v\n%s", r, out)
+		}
 	}
 
 	st := tuicState()

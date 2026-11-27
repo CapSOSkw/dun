@@ -286,7 +286,7 @@ func trimLog(p string, max, keep int64) {
 // ── 端口 ─────────────────────────────────────────────
 func listenInodes(port int) []string { return sockInodes(port, false) }
 
-var procNet = "/proc/net/" // 测试里指到临时目录
+var procDir = "/proc" // 测试里指到临时目录
 
 // UDP 没有监听状态：未连接的套接字是 07，绑了端口再 connect 的是 01，都占着端口
 func sockInodes(port int, udp bool) []string {
@@ -296,7 +296,7 @@ func sockInodes(port int, udp bool) []string {
 	}
 	var res []string
 	for _, f := range files {
-		b, err := os.ReadFile(procNet + f)
+		b, err := os.ReadFile(procDir + "/net/" + f)
 		if err != nil {
 			continue
 		}
@@ -337,12 +337,14 @@ func sockOwner(port int, udp bool) string {
 	for _, i := range inodes {
 		want["socket:["+i+"]"] = true
 	}
-	procs, _ := os.ReadDir("/proc")
+	// 同一端口可能还挂着别的进程已连接的 UDP 套接字：只要有一个是自家的就算 ours，别让排在前面的外部进程盖过去
+	other := ""
+	procs, _ := os.ReadDir(procDir)
 	for _, p := range procs {
 		if !p.IsDir() || p.Name()[0] < '0' || p.Name()[0] > '9' {
 			continue
 		}
-		dir := "/proc/" + p.Name()
+		dir := procDir + "/" + p.Name()
 		fds, err := os.ReadDir(dir + "/fd")
 		if err != nil {
 			continue
@@ -357,11 +359,13 @@ func sockOwner(port int, udp bool) string {
 			if strings.Contains(c, sbConf) || strings.Contains(c, xrayConf) || strings.HasSuffix(c, "dun serve") {
 				return "ours"
 			}
-			if comm, _ := os.ReadFile(dir + "/comm"); len(strings.TrimSpace(string(comm))) > 0 {
-				return strings.TrimSpace(string(comm))
+			if comm, _ := os.ReadFile(dir + "/comm"); other == "" && len(strings.TrimSpace(string(comm))) > 0 {
+				other = strings.TrimSpace(string(comm))
 			}
-			return "未知进程"
 		}
+	}
+	if other != "" {
+		return other
 	}
 	return "未知进程"
 }
@@ -431,11 +435,11 @@ func askPort(st *State, prompt string, def int, key string) int {
 	for {
 		p := askInt(prompt, def, 1, 65535)
 		if _, u := used[p]; u {
-			warn("%d 已经分给本脚本的其他协议了", p)
+			reask("%d 已经分给本脚本的其他协议了", p)
 			continue
 		}
 		if o := portOwner(p); o != "" && o != "ours" && p != current {
-			warn("%d 被 %s 占用，换一个", p, o)
+			reask("%d 被 %s 占用，换一个", p, o)
 			continue
 		}
 		return p

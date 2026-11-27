@@ -175,7 +175,7 @@ func changePort(st *State) {
 		pub = oldPub
 	}
 	if k == "hy2" || k == "tuic" {
-		pub = askUDPPub(st, k, pub)
+		port, pub = askUDPPub(st, k, port, pub)
 	} else {
 		pub = askPubPort(st, pub)
 	}

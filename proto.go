@@ -423,7 +423,7 @@ func freeUDPRange(width int, avoid ...int) (int, int) {
 		busy[p] = true
 	}
 	for _, f := range []string{"udp", "udp6"} {
-		b, _ := os.ReadFile(procNet + f)
+		b, _ := os.ReadFile(procDir + "/net/" + f)
 		for i, line := range strings.Split(string(b), "\n") { // 不看状态：未连接（07）和已连接（01）的都算占用
 			fs := strings.Fields(line)
 			if i == 0 || len(fs) < 4 {
@@ -468,30 +468,37 @@ func askUDPPort(st *State, key string, def int) int {
 	for {
 		p := askInt(protoLabel(key)+" 监听端口（UDP）", def, 1, 65535)
 		if st.udpTaken(p, key) {
-			warn("UDP %d 已经分给本脚本的其他协议了（Hy2 的跳跃范围也算）", p)
+			reask("UDP %d 已经分给本脚本的其他协议了（Hy2 的跳跃范围也算）", p)
 			continue
 		}
 		if o := udpOwner(p); o != "" && o != "ours" {
-			warn("UDP %d 被 %s 占用，换一个", p, o)
+			reask("UDP %d 被 %s 占用，换一个", p, o)
 			continue
 		}
 		return p
 	}
 }
 
-// 映射端口时公网 UDP 端口也不能重：两个协议的链接会指到同一个公网地址和端口。直连时外网端口就是监听端口，上面已经查过
-func askUDPPub(st *State, key string, port int) int {
+// 问外网端口（def 是默认值），返回监听端口和外网端口。两个 UDP 协议的外网端口不能重，否则链接指到同一个公网端口。
+// 端口方式是全局的，可能刚从映射切到直连：直连时外网端口就是监听端口，撞了另一个协议留着的外网端口就得换监听端口
+func askUDPPub(st *State, key string, port, def int) (int, int) {
 	for {
-		pub := askPubPort(st, port)
-		if st.PortMode != portMapped || !st.udpPubTaken(pub, key) {
-			return pub
+		pub := askPubPort(st, def)
+		if !st.udpPubTaken(pub, key) {
+			return port, pub
 		}
-		warn("外网 UDP %d 已经分给本脚本的其他协议了，换一个", pub)
+		reask("外网 UDP %d 已经分给本脚本的其他协议了，换一个", pub)
+		if st.PortMode != portMapped {
+			port = askUDPPort(st, key, port)
+			def = port
+		}
 	}
 }
 
+// 外网端口撞了另一个 UDP 协议的监听端口、外网端口或 Hy2 跳跃范围
 func (st *State) udpPubTaken(pub int, key string) bool {
-	return (st.Hy2 != nil && key != "hy2" && pub == st.Hy2.PubPort) || (st.TUIC != nil && key != "tuic" && pub == st.TUIC.PubPort)
+	return st.udpTaken(pub, key) || (st.Hy2 != nil && key != "hy2" && pub == st.Hy2.PubPort) ||
+		(st.TUIC != nil && key != "tuic" && pub == st.TUIC.PubPort)
 }
 
 func randUDPPort(st *State, key string) int {
@@ -558,7 +565,7 @@ func installHy2(st *State) {
 	hr()
 	info("安装 Hysteria2：gecko 混淆 + 端口跳跃，参数每台机器随机")
 	port := askUDPPort(st, "hy2", randUDPPort(st, "hy2"))
-	pub := askUDPPub(st, "hy2", port)
+	port, pub := askUDPPub(st, "hy2", port, port)
 	h := newHy2(port, pub)
 	setHy2Range(h, st.PortMode, st.tuicPorts()...)
 	tlsHostEnsure(st)
@@ -584,7 +591,7 @@ func installTUIC(st *State) {
 	hr()
 	info("安装 TUIC v5（QUIC），和 Hy2 共用节点域名和证书，端口各用各的")
 	port := askUDPPort(st, "tuic", randUDPPort(st, "tuic"))
-	pub := askUDPPub(st, "tuic", port)
+	port, pub := askUDPPub(st, "tuic", port, port)
 	tlsHostEnsure(st)
 	st.TUIC = &TUIC{Port: port, PubPort: pub, UUID: newUUID(), Password: randLabel(32), CC: "bbr"}
 	fwOpenProto(fmt.Sprint(port), "udp")
