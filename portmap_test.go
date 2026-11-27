@@ -26,10 +26,19 @@ func TestCloudPortMapping(t *testing.T) {
 	if got := askPubPort(&st, 8443); got != 8443 {
 		t.Fatalf("第二个协议的外网端口 = %d", got)
 	}
+	oldHop := hopUsable
+	t.Cleanup(func() { hopUsable = oldHop })
+	hopUsable = func() bool { return true }
 	h := &Hy2{}
 	setHy2Range(h, st.PortMode)
 	if h.HopStart <= 0 || h.HopEnd <= h.HopStart {
 		t.Fatal("独享公网实例没有分配跳跃范围")
+	}
+	hopUsable = func() bool { return false }
+	h = &Hy2{}
+	setHy2Range(h, st.PortMode)
+	if h.HopStart != 0 {
+		t.Fatal("加不了 nat 规则时不该分配跳跃范围")
 	}
 }
 

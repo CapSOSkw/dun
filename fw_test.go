@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -98,5 +99,26 @@ func TestFwFields(t *testing.T) {
 	f := fwFields(`-A INPUT -m comment --comment "a \"b\" c" -j DROP`)
 	if len(f) != 8 || f[5] != `a "b" c` || f[7] != "DROP" {
 		t.Fatalf("%q", f)
+	}
+}
+
+func TestTrimLog(t *testing.T) {
+	p := t.TempDir() + "/dun.log"
+	var b strings.Builder
+	for i := 0; b.Len() < 3000; i++ {
+		b.WriteString("line " + strings.Repeat("x", i%7) + "\n")
+	}
+	b.WriteString("last line\n")
+	os.WriteFile(p, []byte(b.String()), 0644)
+	trimLog(p, 1000, 200)
+	got, _ := os.ReadFile(p)
+	if len(got) > 200 || !strings.HasSuffix(string(got), "last line\n") || !strings.HasPrefix(string(got), "line") {
+		t.Fatalf("截断不对：%d 字节 %q", len(got), got)
+	}
+	small := t.TempDir() + "/small.log"
+	os.WriteFile(small, []byte("a\nb\n"), 0644)
+	trimLog(small, 1000, 200)
+	if got, _ := os.ReadFile(small); string(got) != "a\nb\n" {
+		t.Fatal("没超过上限的不该动")
 	}
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/x509"
 	"fmt"
@@ -236,6 +237,43 @@ func svcLog(n int, follow bool) {
 		return
 	}
 	runTTY("tail", args...)
+}
+
+// OpenRC 下服务的输出直接写 /var/log，没人轮转。超过 20MB 就只留最后 2MB，免得把小鸡的硬盘写满；
+// systemd 下日志进 journald，由它自己轮转，用不着这个
+func trimLogs() {
+	for _, s := range []string{svcBox, svcWeb, svcXray, svcArgo} {
+		trimLog("/var/log/"+s+".log", 20<<20, 2<<20)
+	}
+}
+
+func logTrimLoop() {
+	for {
+		time.Sleep(6 * time.Hour)
+		trimLogs()
+	}
+}
+
+// 原地截断，supervise-daemon 是追加写的，截完接着往末尾写
+func trimLog(p string, max, keep int64) {
+	f, err := os.OpenFile(p, os.O_RDWR, 0)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil || fi.Size() <= max {
+		return
+	}
+	buf := make([]byte, keep)
+	n, _ := f.ReadAt(buf, fi.Size()-keep)
+	buf = buf[:n]
+	if i := bytes.IndexByte(buf, '\n'); i >= 0 {
+		buf = buf[i+1:]
+	}
+	if f.Truncate(0) == nil {
+		f.WriteAt(buf, 0)
+	}
 }
 
 // ── 端口 ─────────────────────────────────────────────

@@ -481,8 +481,31 @@ func setHy2Range(h *Hy2, mode string) {
 		h.HopStart, h.HopEnd = 0, 0
 		info("使用服务商分配的 UDP 端口，Hy2 走单端口")
 	} else if h.HopStart == 0 {
-		h.HopStart, h.HopEnd = freeUDPRange(r2(2000, 6000))
+		if hopUsable() {
+			h.HopStart, h.HopEnd = freeUDPRange(r2(2000, 6000))
+		} else {
+			warn("这台机器加不了 iptables 的端口转发规则，Hy2 走单端口")
+		}
 	}
+}
+
+// 端口跳跃靠 iptables 的 nat 规则把一段 UDP 转到 Hy2 端口。没有 iptables 就先装；
+// 装不上，或者容器不让加 nat 规则，就别分配跳跃范围，免得订阅里带着跳不过去的端口
+var hopUsable = func() bool {
+	if !have("iptables") {
+		info("端口跳跃要用 iptables，先装上")
+		pkgInstall("iptables")
+	}
+	if !have("iptables") {
+		return false
+	}
+	probe := []string{"-t", "nat", "-A", "PREROUTING", "-p", "udp", "--dport", "1", "-m", "comment", "--comment", hopTag + "-probe", "-j", "REDIRECT", "--to-ports", "2"}
+	if run("iptables", probe...) != nil {
+		return false
+	}
+	probe[2] = "-D"
+	run("iptables", probe...)
+	return true
 }
 
 func installHy2(st *State) {
