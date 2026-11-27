@@ -374,7 +374,9 @@ func removeReality(st *State) {
 		warn("Reality 没装")
 		return
 	}
+	old := st.Reality.Port
 	st.Reality = nil
+	fwCloseUnused(st, fmt.Sprint(old), "tcp")
 	applyAll(st)
 	tlsHostRelease(st)
 	zoneRelease(st)
@@ -386,7 +388,9 @@ func removeAnyTLS(st *State) {
 		warn("AnyTLS 没装")
 		return
 	}
+	old := st.AnyTLS.Port
 	st.AnyTLS = nil
+	fwCloseUnused(st, fmt.Sprint(old), "tcp")
 	applyAll(st)
 	tlsHostRelease(st)
 	zoneRelease(st)
@@ -408,6 +412,7 @@ func removeWS(st *State) {
 		warn("没有 CF 凭据，%s 的解析和规则请自己去 CF 后台删", w.Host)
 	}
 	st.WS = nil
+	fwCloseUnused(st, fmt.Sprint(w.Port), "tcp")
 	applyAll(st)
 	if st.Argo == nil { // Argo 也用这份优选缓存
 		os.Remove(wetestPath)
@@ -477,16 +482,23 @@ func newHy2(port, pub int) *Hy2 {
 }
 
 func setHy2Range(h *Hy2, mode string) {
-	if mode == portMapped {
+	switch {
+	case mode == portMapped:
 		h.HopStart, h.HopEnd = 0, 0
 		info("使用服务商分配的 UDP 端口，Hy2 走单端口")
-	} else if h.HopStart == 0 {
-		if hopUsable() {
-			h.HopStart, h.HopEnd = freeUDPRange(r2(2000, 6000))
-		} else {
-			warn("这台机器加不了 iptables 的端口转发规则，Hy2 走单端口")
-		}
+	case !hopUsable(): // 已有范围也要探测：换到不让加 nat 规则的环境后别再发跳不过去的范围
+		h.HopStart, h.HopEnd = 0, 0
+		warn("这台机器加不了 iptables 的端口转发规则，Hy2 走单端口")
+	case h.HopStart == 0:
+		h.HopStart, h.HopEnd = freeUDPRange(r2(2000, 6000))
 	}
+}
+
+func hopRange(h *Hy2) string {
+	if h == nil || h.HopStart == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%d:%d", h.HopStart, h.HopEnd)
 }
 
 // 端口跳跃靠 iptables 的 nat 规则把一段 UDP 转到 Hy2 端口。没有 iptables 就先装；
@@ -504,7 +516,10 @@ var hopUsable = func() bool {
 		return false
 	}
 	probe[2] = "-D"
-	run("iptables", probe...)
+	if run("iptables", probe...) != nil {
+		warn("端口跳跃的探测规则没删掉，请自己删：iptables %s", strings.Join(probe, " "))
+		return false
+	}
 	return true
 }
 
@@ -540,7 +555,12 @@ func removeHy2(st *State) {
 		warn("Hysteria2 没装")
 		return
 	}
+	old, oldHop := st.Hy2.Port, hopRange(st.Hy2)
 	st.Hy2 = nil
+	fwCloseUnused(st, fmt.Sprint(old), "udp")
+	if oldHop != "" {
+		fwCloseUnused(st, oldHop, "udp")
+	}
 	applyAll(st)
 	tlsHostRelease(st)
 	zoneRelease(st)

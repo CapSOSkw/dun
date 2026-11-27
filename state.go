@@ -8,7 +8,6 @@ import (
 
 const (
 	baseDir     = "/etc/dun"
-	statePath   = baseDir + "/state.json"
 	cfPath      = baseDir + "/cf.json"
 	sbBin       = baseDir + "/bin/sing-box"
 	sbConf      = baseDir + "/sing-box.json"
@@ -31,6 +30,9 @@ const (
 	svcArgo     = "dun-argo"
 	argoPrefix  = "dun argo "
 )
+
+// 测试里指到临时目录
+var statePath = baseDir + "/state.json"
 
 // dun upgrade 从这个仓库的 Release 拉新版本；发版时 workflow 会用 -X main.repo 注入当前仓库
 var repo = "CapSOSkw/dun"
@@ -89,6 +91,12 @@ type Hy2 struct {
 	HopEnd   int    `json:"hop_end,omitempty"`
 	HopSec   int    `json:"hop_sec"`
 }
+
+// hopApply 没加上跳跃规则时置位。订阅每次请求都重读状态，所以记在进程里，不存盘
+var hopDown bool
+
+// 跳跃规则真加上了才往链接和订阅里写范围
+func (h *Hy2) hopping() bool { return h.HopStart > 0 && !hopDown }
 
 type WS struct {
 	Host     string      `json:"host"`
@@ -181,12 +189,28 @@ func (s *State) installed() bool {
 func (s *State) needTLS() bool { return s.Reality != nil || s.AnyTLS != nil || s.Hy2 != nil }
 
 func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, mode); err != nil {
+	// 同目录独占的临时文件，rename 才是原子的，同时写也不会互相覆盖临时文件
+	f, err := os.CreateTemp(dir, filepath.Base(path)+".tmp*")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	tmp := f.Name()
+	_, err = f.Write(data)
+	if err == nil {
+		err = f.Chmod(mode)
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Rename(tmp, path)
+	}
+	if err != nil {
+		os.Remove(tmp)
+	}
+	return err
 }

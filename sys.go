@@ -254,7 +254,8 @@ func logTrimLoop() {
 	}
 }
 
-// 原地截断，supervise-daemon 是追加写的，截完接着往末尾写
+// 原地截断，supervise-daemon 是追加写的，截完接着往末尾写。
+// shortcut: 读尾部到截断之间服务新写的几行会丢（copytruncate 的固有限制），要一行不丢得换成服务配合的轮转
 func trimLog(p string, max, keep int64) {
 	f, err := os.OpenFile(p, os.O_RDWR, 0)
 	if err != nil {
@@ -266,13 +267,18 @@ func trimLog(p string, max, keep int64) {
 		return
 	}
 	buf := make([]byte, keep)
-	n, _ := f.ReadAt(buf, fi.Size()-keep)
-	buf = buf[:n]
+	if n, err := f.ReadAt(buf, fi.Size()-keep); err != nil || int64(n) != keep {
+		return // 尾巴没读全就不截，免得把日志清空
+	}
 	if i := bytes.IndexByte(buf, '\n'); i >= 0 {
 		buf = buf[i+1:]
 	}
-	if f.Truncate(0) == nil {
-		f.WriteAt(buf, 0)
+	if err := f.Truncate(0); err != nil {
+		warn("截断 %s 失败：%v", p, err)
+		return
+	}
+	if _, err := f.WriteAt(buf, 0); err != nil {
+		warn("%s 截断后写回最后 %d 字节失败：%v", p, len(buf), err)
 	}
 }
 
@@ -474,10 +480,20 @@ func selectPortMode(st *State, addrs []net.Addr) string {
 	return portDirect
 }
 
+// 端口方式是全局的：换成映射端口后，已装的 Hy2 也只能走单端口；别的协议端口不动
+func (st *State) setPortMode(mode string) {
+	st.PortMode = mode
+	if h := st.Hy2; h != nil && mode == portMapped && h.HopStart > 0 {
+		old := hopRange(h)
+		setHy2Range(h, mode)
+		fwCloseUnused(st, old, "udp")
+	}
+}
+
 func askPubPort(st *State, p int) int {
 	if st.PortMode != portDirect && st.PortMode != portMapped {
 		addrs, _ := net.InterfaceAddrs()
-		st.PortMode = selectPortMode(st, addrs)
+		st.setPortMode(selectPortMode(st, addrs))
 	}
 	if st.PortMode == portMapped {
 		return askInt("  服务商分配的外网端口", p, 1, 65535)

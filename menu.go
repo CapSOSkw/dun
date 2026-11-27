@@ -100,7 +100,7 @@ func showLinks(st *State) {
 	}
 	if st.Hy2 != nil {
 		l := linkHy2(st, base+"-Hy2")
-		if st.Hy2.HopStart > 0 {
+		if st.Hy2.hopping() {
 			b.WriteString("【Hysteria2】UDP，gecko 混淆 + 端口跳跃，线路差的机器用\n" + l + "\n")
 			b.WriteString(fmt.Sprintf("端口跳跃 %d-%d，订阅里已经带上\n", st.Hy2.HopStart, st.Hy2.HopEnd))
 		} else {
@@ -157,7 +157,7 @@ func changePort(st *State) {
 		port = askPort(st, protoLabel(k)+" 新端口", oldPort, k)
 	}
 	addrs, _ := net.InterfaceAddrs()
-	st.PortMode = selectPortMode(st, addrs)
+	st.setPortMode(selectPortMode(st, addrs))
 	pub := port
 	if st.PortMode == portMapped && port == oldPort && oldPub > 0 {
 		pub = oldPub
@@ -165,9 +165,16 @@ func changePort(st *State) {
 	pub = askPubPort(st, pub)
 	switch k {
 	case "hy2":
+		oldHop := hopRange(st.Hy2)
 		st.Hy2.Port, st.Hy2.PubPort = port, pub
 		fwOpenProto(fmt.Sprint(port), "udp")
 		setHy2Range(st.Hy2, st.PortMode)
+		if port != oldPort {
+			fwCloseUnused(st, fmt.Sprint(oldPort), "udp")
+		}
+		if oldHop != "" && oldHop != hopRange(st.Hy2) {
+			fwCloseUnused(st, oldHop, "udp")
+		}
 		if st.Hy2.HopStart > 0 {
 			fwOpenProto(fmt.Sprintf("%d:%d", st.Hy2.HopStart, st.Hy2.HopEnd), "udp")
 			info("云安全组请放行 UDP %d 和 %d-%d", pub, st.Hy2.HopStart, st.Hy2.HopEnd)
@@ -184,6 +191,9 @@ func changePort(st *State) {
 		st.WS.Port, st.WS.PubPort = port, pub
 	}
 	fwOpen(port)
+	if port != oldPort {
+		fwCloseUnused(st, fmt.Sprint(oldPort), "tcp")
+	}
 	applyAll(st)
 	if k == "ws" {
 		wsRules(st, cfLogin())
@@ -599,7 +609,7 @@ func statusLine(st *State) {
 	h := ""
 	if st.Hy2 != nil {
 		h = fmt.Sprintf("UDP %d", st.Hy2.Port)
-		if st.Hy2.HopStart > 0 {
+		if st.Hy2.hopping() {
 			h += fmt.Sprintf("（跳跃 %d-%d）", st.Hy2.HopStart, st.Hy2.HopEnd)
 		}
 	}

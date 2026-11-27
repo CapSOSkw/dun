@@ -1,8 +1,10 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -18,6 +20,22 @@ type fwFamily struct{ bin, restore, file string }
 var fwFamilies = []fwFamily{
 	{"iptables", "iptables-restore", "/etc/iptables/rules.v4"},
 	{"ip6tables", "ip6tables-restore", "/etc/iptables/rules.v6"},
+}
+
+// 测试里换成替身，不碰真实的 iptables
+var (
+	fwHave = have
+	fwCmd  = run
+	fwOut  = runOut
+	fwTest = func(restore, content string) error {
+		c := exec.Command(restore, "--test")
+		c.Stdin = strings.NewReader(content)
+		return c.Run()
+	}
+)
+
+func fwSpec(ps, proto string) []string {
+	return []string{"-p", proto, "-m", proto, "--dport", ps, "-m", "comment", "--comment", fwTag, "-j", "ACCEPT"}
 }
 
 func fwOpen(p int) { fwOpenProto(strconv.Itoa(p), "tcp") }
@@ -45,40 +63,57 @@ func fwOpenProto(ps, proto string) {
 }
 
 func fwAllow(fam fwFamily, ps, proto string, managed bool) {
-	if !have(fam.bin) {
+	if !fwHave(fam.bin) {
 		return
 	}
-	out, err := runOut(fam.bin, "-S", "INPUT")
+	out, err := fwOut(fam.bin, "-S", "INPUT")
 	if err != nil {
 		return
 	}
-	pos, need := fwInsertPos(strings.Split(out, "\n"), managed)
+	lines := strings.Split(out, "\n")
+	pos, need := fwInsertPos(lines, managed)
 	if !need {
 		return
 	}
 	plain := []string{"-p", proto, "-m", proto, "--dport", ps, "-j", "ACCEPT"}
-	if run(fam.bin, append([]string{"-C", "INPUT"}, plain...)...) == nil {
-		// 已经有不带标记的同一条，旧版 dun 或者用户自己加的，开机文件也由当初加它的人管
+	if fwRuleBefore(lines, "-A INPUT "+strings.Join(plain, " "), pos) {
+		// 兜底拦截前面已经有不带标记的同一条，旧版 dun 或者用户自己加的，开机文件也由当初加它的人管
 		info("%s 已放行 %s/%s", fam.bin, ps, proto)
 		return
 	}
-	spec := []string{"-p", proto, "-m", proto, "--dport", ps, "-m", "comment", "--comment", fwTag, "-j", "ACCEPT"}
-	if run(fam.bin, append([]string{"-C", "INPUT"}, spec...)...) != nil {
+	spec := fwSpec(ps, proto)
+	if fwCmd(fam.bin, append([]string{"-C", "INPUT"}, spec...)...) != nil {
 		where := []string{"-A", "INPUT"}
 		if pos > 0 {
 			where = []string{"-I", "INPUT", strconv.Itoa(pos)}
 		}
-		if run(fam.bin, append(where, spec...)...) != nil {
-			// 有的容器内核没有 comment 模块，退回不带标记的写法，这种卸载时认不出来，留着
-			spec = plain
-			if run(fam.bin, append(where, spec...)...) != nil {
-				warn("%s 放行 %s/%s 失败，请自己放行", fam.bin, ps, proto)
-				return
-			}
+		if fwCmd(fam.bin, append(where, spec...)...) != nil {
+			// 不退回不带标记的写法：那样卸载时认不出是 dun 加的，旧端口会一直开着
+			warn("%s 放行 %s/%s 失败（可能缺 comment 模块），请自己放行", fam.bin, ps, proto)
+			return
 		}
 	}
 	info("%s 已放行 %s/%s", fam.bin, ps, proto)
 	fwPersist(fam, "-A INPUT "+strings.Join(spec, " "))
+}
+
+// INPUT 链第 pos 条（从 1 数，0 表示规则加在最后）前面有没有一模一样的 rule
+func fwRuleBefore(lines []string, rule string, pos int) bool {
+	n := 0
+	for _, l := range lines {
+		f := fwFields(l)
+		if len(f) < 2 || f[0] != "-A" || f[1] != "INPUT" {
+			continue
+		}
+		n++
+		if pos > 0 && n >= pos {
+			return false
+		}
+		if strings.Join(f, " ") == rule {
+			return true
+		}
+	}
+	return false
 }
 
 // 看 iptables -S INPUT 的输出，判断 INPUT 链会不会挡住新连接，返回放行规则该插在第几条前面，0 表示加在最后。
@@ -225,12 +260,12 @@ func fwInsertLine(content, line string) (string, bool) {
 	return strings.Join(out, "\n"), true
 }
 
-// 去掉规则文件里带 dun-allow 标记的行，别的行一个字节都不动
-func fwStripTagged(content string) (string, bool) {
+// 去掉规则文件里 match 认出来的行，别的行一个字节都不动
+func fwStrip(content string, match func(string) bool) (string, bool) {
 	ls := strings.Split(content, "\n")
 	out := make([]string, 0, len(ls))
 	for _, l := range ls {
-		if !fwTagged(l) {
+		if !match(l) {
 			out = append(out, l)
 		}
 	}
@@ -247,25 +282,27 @@ func fwPersist(fam fwFamily, line string) {
 	if !changed {
 		return
 	}
-	if bak := fam.file + ".dun.bak"; !exists(bak) {
-		if os.WriteFile(bak, b, 0600) != nil {
-			warn("备份 %s 失败，放行规则没写进去，机器重启后要重新放行", fam.file)
-			return
-		}
-	}
 	if !fwWriteRules(fam, nb) {
 		warn("放行规则没写进 %s，机器重启后要重新放行", fam.file)
 	}
 }
 
-// 先用 iptables-restore --test 过一遍，过不了就不写；权限照原文件
+// 开机规则文件只从这里写：没有备份先备份，iptables-restore --test 过了再原子替换；权限照原文件
 func fwWriteRules(fam fwFamily, content string) bool {
-	if !have(fam.restore) {
+	if !fwHave(fam.restore) {
 		return false
 	}
-	c := exec.Command(fam.restore, "--test")
-	c.Stdin = strings.NewReader(content)
-	if c.Run() != nil {
+	old, err := os.ReadFile(fam.file)
+	if err != nil {
+		return false
+	}
+	if bak := fam.file + ".dun.bak"; !exists(bak) {
+		if os.WriteFile(bak, old, 0600) != nil {
+			warn("备份 %s 失败，没有改它", fam.file)
+			return false
+		}
+	}
+	if fwTest(fam.restore, content) != nil {
 		return false
 	}
 	mode := os.FileMode(0640)
@@ -278,34 +315,70 @@ func fwWriteRules(fam fwFamily, content string) bool {
 // 卸载时删掉 dun 加的放行规则，实时的和开机文件里的都删。ufw、firewalld 里的不动
 func fwCleanup() {
 	for _, fam := range fwFamilies {
-		if !have(fam.bin) {
-			continue
+		fwRemove(fam, fwTagged)
+	}
+}
+
+// 单个协议卸载或换端口后，删掉旧端口的放行规则；别的协议还在用同一端口、协议就留着
+func fwCloseUnused(st *State, ps, proto string) {
+	if st.fwInUse(ps, proto) {
+		return
+	}
+	rule := "-A INPUT " + strings.Join(fwSpec(ps, proto), " ")
+	for _, fam := range fwFamilies {
+		fwRemove(fam, func(l string) bool { return strings.Join(fwFields(l), " ") == rule })
+	}
+}
+
+// ps 是 fwOpenProto 放行时用的写法：单个端口，或者 Hy2 跳跃的 20000:21000
+func (st *State) fwInUse(ps, proto string) bool {
+	var used []string
+	if proto == "tcp" {
+		for _, k := range []string{"reality", "anytls", "ws"} {
+			if p, _ := curPorts(st, k); p > 0 {
+				used = append(used, strconv.Itoa(p))
+			}
 		}
-		out, _ := runOut(fam.bin, "-S", "INPUT")
+	} else if h := st.Hy2; h != nil {
+		used = append(used, strconv.Itoa(h.Port))
+		if h.HopStart > 0 {
+			used = append(used, fmt.Sprintf("%d:%d", h.HopStart, h.HopEnd))
+		}
+	}
+	return slices.Contains(used, ps)
+}
+
+func fwRemove(fam fwFamily, match func(string) bool) {
+	if !fwHave(fam.bin) {
+		return
+	}
+	if out, err := fwOut(fam.bin, "-S", "INPUT"); err != nil {
+		warn("读不到 %s 的 INPUT 规则，带 %s 标记的放行规则可能还在：%v", fam.bin, fwTag, err)
+	} else {
 		for _, l := range strings.Split(out, "\n") {
-			if fwTagged(l) {
-				run(fam.bin, append([]string{"-D"}, fwFields(l)[1:]...)...)
+			if match(l) && fwCmd(fam.bin, append([]string{"-D"}, fwFields(l)[1:]...)...) != nil {
+				warn("%s 删不掉这条规则，请自己删：%s", fam.bin, strings.TrimSpace(l))
 			}
 		}
-		b, err := os.ReadFile(fam.file)
-		if err != nil {
-			continue
-		}
-		nb, changed := fwStripTagged(string(b))
-		if !changed {
-			continue
-		}
-		if !fwWriteRules(fam, nb) {
-			warn("%s 里带 %s 标记的放行规则没删掉，可以自己删", fam.file, fwTag)
-			continue
-		}
-		bak := fam.file + ".dun.bak"
-		if ob, err := os.ReadFile(bak); err == nil {
-			if string(ob) == nb {
-				os.Remove(bak)
-			} else {
-				info("%s 和 dun 改动前不一样了，改动前的备份留在 %s", fam.file, bak)
-			}
+	}
+	b, err := os.ReadFile(fam.file)
+	if err != nil {
+		return
+	}
+	nb, changed := fwStrip(string(b), match)
+	if !changed {
+		return
+	}
+	if !fwWriteRules(fam, nb) {
+		warn("%s 里带 %s 标记的放行规则没删掉，可以自己删", fam.file, fwTag)
+		return
+	}
+	bak := fam.file + ".dun.bak"
+	if ob, err := os.ReadFile(bak); err == nil {
+		if string(ob) == nb {
+			os.Remove(bak)
+		} else if _, more := fwStrip(nb, fwTagged); !more {
+			info("%s 和 dun 改动前不一样了，改动前的备份留在 %s", fam.file, bak)
 		}
 	}
 }

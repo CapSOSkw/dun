@@ -69,7 +69,7 @@ func TestFwRulesFile(t *testing.T) {
 	}
 	udp := "-A INPUT -p udp -m udp --dport 20000:21000 -m comment --comment dun-allow -j ACCEPT"
 	got, _ = fwInsertLine(got, udp)
-	back, changed := fwStripTagged(got)
+	back, changed := fwStrip(got, fwTagged)
 	if !changed || back != ociRules {
 		t.Fatalf("删掉标记行后和原文件不一致：\n%s", back)
 	}
@@ -120,5 +120,100 @@ func TestTrimLog(t *testing.T) {
 	trimLog(small, 1000, 200)
 	if got, _ := os.ReadFile(small); string(got) != "a\nb\n" {
 		t.Fatal("没超过上限的不该动")
+	}
+}
+
+// 换上 iptables 替身：-S INPUT 返回 rules，fail 认出来的命令返回失败，其余成功；返回记下的命令
+func fakeFw(t *testing.T, rules string, fail func(args []string) bool) *[]string {
+	var cmds []string
+	oh, oc, oo, ot, of := fwHave, fwCmd, fwOut, fwTest, fwFamilies
+	t.Cleanup(func() { fwHave, fwCmd, fwOut, fwTest, fwFamilies = oh, oc, oo, ot, of })
+	fwHave = func(string) bool { return true }
+	fwOut = func(name string, args ...string) (string, error) { return rules, nil }
+	fwCmd = func(name string, args ...string) error {
+		cmds = append(cmds, strings.Join(args, " "))
+		if fail(args) {
+			return os.ErrPermission
+		}
+		return nil
+	}
+	fwTest = func(string, string) error { return nil }
+	return &cmds
+}
+
+func TestFwAllowNoUntaggedFallback(t *testing.T) {
+	// 带标记的规则加不上（比如容器缺 comment 模块），不能退回不带标记的写法
+	cmds := fakeFw(t, "-P INPUT ACCEPT\n-A INPUT -j REJECT", func(a []string) bool {
+		return a[0] == "-C" || strings.Contains(strings.Join(a, " "), "--comment")
+	})
+	fwAllow(fwFamily{"iptables", "iptables-restore", t.TempDir() + "/none"}, "443", "tcp", false)
+	for _, c := range *cmds {
+		if (strings.HasPrefix(c, "-I ") || strings.HasPrefix(c, "-A ")) && !strings.Contains(c, fwTag) {
+			t.Fatalf("加了不带标记的规则：%s", c)
+		}
+	}
+	if len(*cmds) != 2 {
+		t.Fatalf("命令不对：%q", *cmds)
+	}
+}
+
+func TestFwRuleBefore(t *testing.T) {
+	plain := "-A INPUT -p tcp -m tcp --dport 443 -j ACCEPT"
+	before := strings.Split("-A INPUT "+plain[9:]+"\n-A INPUT -j REJECT", "\n")
+	after := strings.Split("-A INPUT -j REJECT\n"+plain, "\n")
+	if !fwRuleBefore(before, plain, 2) || fwRuleBefore(after, plain, 1) || !fwRuleBefore(after, plain, 0) {
+		t.Fatal("没按位置判断已有的放行规则")
+	}
+}
+
+func TestFwWriteRulesBackup(t *testing.T) {
+	fakeFw(t, "", func([]string) bool { return false })
+	p := t.TempDir() + "/rules.v4"
+	os.WriteFile(p, []byte(ociRules), 0640)
+	fam := fwFamily{"iptables", "iptables-restore", p}
+	fwTest = func(string, string) error { return os.ErrInvalid }
+	if fwWriteRules(fam, "bad") {
+		t.Fatal("校验不过也写了")
+	}
+	if b, _ := os.ReadFile(p); string(b) != ociRules {
+		t.Fatal("校验不过却改了文件")
+	}
+	os.Remove(p + ".dun.bak") // 模拟备份被删掉
+	fwTest = func(string, string) error { return nil }
+	if !fwWriteRules(fam, "new") {
+		t.Fatal("没写进去")
+	}
+	if b, _ := os.ReadFile(p + ".dun.bak"); string(b) != ociRules {
+		t.Fatal("改之前没备份原文件")
+	}
+	if b, _ := os.ReadFile(p); string(b) != "new" {
+		t.Fatal("新内容没写进去")
+	}
+}
+
+func TestFwCloseUnused(t *testing.T) {
+	r443 := "-A INPUT -p tcp -m tcp --dport 443 -m comment --comment dun-allow -j ACCEPT"
+	r8443 := "-A INPUT -p tcp -m tcp --dport 8443 -m comment --comment dun-allow -j ACCEPT"
+	cmds := fakeFw(t, r443+"\n"+r8443, func([]string) bool { return false })
+	p := t.TempDir() + "/rules.v4"
+	file := strings.Replace(ociRules, "-A INPUT -j REJECT", r443+"\n"+r8443+"\n-A INPUT -j REJECT", 1)
+	os.WriteFile(p, []byte(file), 0640)
+	fwFamilies = []fwFamily{{"iptables", "iptables-restore", p}}
+
+	st := &State{Reality: &Reality{Port: 443}, Hy2: &Hy2{Port: 443, HopStart: 20000, HopEnd: 21000}}
+	if !st.fwInUse("443", "tcp") || !st.fwInUse("20000:21000", "udp") || st.fwInUse("8443", "tcp") || st.fwInUse("8443", "udp") {
+		t.Fatal("端口占用判断不对")
+	}
+	fwCloseUnused(st, "443", "tcp") // Reality 还在用
+	if len(*cmds) != 0 {
+		t.Fatalf("端口还在用却删了规则：%q", *cmds)
+	}
+	fwCloseUnused(st, "8443", "tcp")
+	if len(*cmds) != 1 || (*cmds)[0] != "-D"+r8443[2:] {
+		t.Fatalf("实时规则删得不对：%q", *cmds)
+	}
+	b, _ := os.ReadFile(p)
+	if strings.Contains(string(b), "8443") || !strings.Contains(string(b), r443) {
+		t.Fatalf("开机文件删得不对：\n%s", b)
 	}
 }

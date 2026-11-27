@@ -252,14 +252,17 @@ func hopApply(st *State) {
 		return
 	}
 	rng := fmt.Sprintf("%d:%d", h.HopStart, h.HopEnd)
+	// 纯 IPv6 的机器得 ip6tables 加上才算数
+	need := map[string]bool{"iptables": st.IP4 != "" || st.IP6 == "", "ip6tables": st.IP6 != ""}
 	added := false
 	for _, bin := range []string{"iptables", "ip6tables"} {
 		if have(bin) && run(bin, "-t", "nat", "-A", "PREROUTING", "-p", "udp", "--dport", rng,
-			"-m", "comment", "--comment", hopTag, "-j", "REDIRECT", "--to-ports", fmt.Sprint(h.Port)) == nil {
+			"-m", "comment", "--comment", hopTag, "-j", "REDIRECT", "--to-ports", fmt.Sprint(h.Port)) == nil && need[bin] {
 			added = true
 		}
 	}
+	hopDown = !added
 	if !added {
-		warn("端口跳跃规则加不上，只能用单端口 %d", h.Port)
+		warn("端口跳跃规则加不上，只能用单端口 %d，链接和订阅里先不带跳跃范围", h.Port)
 	}
 }

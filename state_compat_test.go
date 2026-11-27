@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"encoding/json"
 	"net"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -85,5 +87,53 @@ func TestV112StateRoundTrip(t *testing.T) {
 	in = bufio.NewReader(strings.NewReader("\n"))
 	if got := selectPortMode(&mapped, private); got != portMapped {
 		t.Fatalf("有映射端口的旧配置默认端口方式 = %q", got)
+	}
+}
+
+// 走真正的 loadState、save 落盘：nat 为 true、false、省略三种旧文件，读→存→再读后端口和 fork 字段都不变
+func TestV112StateOnDisk(t *testing.T) {
+	old := statePath
+	t.Cleanup(func() { statePath = old })
+	for _, tc := range []struct{ name, json string }{
+		{"nat=true", v112State},
+		{"nat=false", strings.Replace(v112State, `"nat": true`, `"nat": false`, 1)},
+		{"省略nat", strings.Replace(v112State, `"nat": true,`, "", 1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			statePath = filepath.Join(t.TempDir(), "dun", "state.json")
+			os.MkdirAll(filepath.Dir(statePath), 0700)
+			if err := os.WriteFile(statePath, []byte(tc.json), 0600); err != nil {
+				t.Fatal(err)
+			}
+			loadState().save()
+			st := loadState()
+			b, err := os.ReadFile(statePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var orig, saved map[string]any
+			if json.Unmarshal([]byte(tc.json), &orig) != nil || json.Unmarshal(b, &saved) != nil {
+				t.Fatal("JSON 解不开")
+			}
+			for _, k := range []string{"reality", "anytls", "ws", "argo", "cfip", "zone", "tls", "token", "disguise", "ip4"} {
+				if !reflect.DeepEqual(orig[k], saved[k]) {
+					t.Fatalf("%s 落盘往返后变了：\n原 %v\n现 %v", k, orig[k], saved[k])
+				}
+			}
+			if _, has := saved["nat"]; has || st.PortMode != "" {
+				t.Fatalf("旧文件不该凭空多出端口方式：nat 留着=%v，port_mode=%q", has, st.PortMode)
+			}
+			if st.Reality.Port != 443 || st.Reality.PubPort != 443 || st.AnyTLS.Port != 45678 || st.AnyTLS.PubPort != 45678 ||
+				st.WS.Port != 8443 || st.WS.PubPort != 8443 || st.WS.Inner != 21004 {
+				t.Fatal("Reality / AnyTLS / CF WS 端口变了")
+			}
+			a := st.Argo
+			if a.Inner != 21001 || a.Web != 21002 || a.Metrics != 21005 || !a.External || !a.HTTP2 || a.Tunnel != "c1744f8b-faa1-48a4-9e5c-02ac921467fa" {
+				t.Fatalf("Argo 字段变了：%+v", a)
+			}
+			if st.CFIP != (CFIPOpt{NoTokyo: true, Wetest: true, V6: true, NoH3: true}) {
+				t.Fatalf("CFIP 变了：%+v", st.CFIP)
+			}
+		})
 	}
 }

@@ -92,3 +92,47 @@ func TestLimitedUDPPorts(t *testing.T) {
 		t.Fatal("受限映射启用了跳跃")
 	}
 }
+
+func TestHy2RangeFollowsProbeAndMode(t *testing.T) {
+	oldHop := hopUsable
+	t.Cleanup(func() { hopUsable = oldHop })
+
+	// 已有范围，换到加不了 nat 规则的环境：回落单端口
+	hopUsable = func() bool { return false }
+	h := &Hy2{Port: 443, HopStart: 20000, HopEnd: 21000}
+	setHy2Range(h, portDirect)
+	if h.HopStart != 0 || h.HopEnd != 0 {
+		t.Fatal("探测失败时没清掉已有的跳跃范围")
+	}
+	// 已有范围、探测成功：范围不变
+	hopUsable = func() bool { return true }
+	h = &Hy2{Port: 443, HopStart: 20000, HopEnd: 21000}
+	setHy2Range(h, portDirect)
+	if h.HopStart != 20000 || h.HopEnd != 21000 {
+		t.Fatal("探测成功却换了跳跃范围")
+	}
+
+	// 改别的协议时选了映射端口：Hy2 跟着走单端口，别的协议端口一个不动
+	st := &State{Reality: &Reality{Port: 443, PubPort: 443}, AnyTLS: &AnyTLS{Port: 8443, PubPort: 30001},
+		WS: &WS{Port: 2053, PubPort: 2053}, Hy2: &Hy2{Port: 5443, PubPort: 5443, HopStart: 20000, HopEnd: 21000}}
+	st.setPortMode(portMapped)
+	if st.PortMode != portMapped || st.Hy2.HopStart != 0 || st.Hy2.HopEnd != 0 {
+		t.Fatal("映射端口模式下 Hy2 还留着跳跃范围")
+	}
+	if st.Reality.Port != 443 || st.Reality.PubPort != 443 || st.AnyTLS.Port != 8443 || st.AnyTLS.PubPort != 30001 ||
+		st.WS.Port != 2053 || st.WS.PubPort != 2053 || st.Hy2.Port != 5443 || st.Hy2.PubPort != 5443 {
+		t.Fatal("切端口方式动了已有协议的端口")
+	}
+}
+
+func TestHy2LinkSkipsInactiveHop(t *testing.T) {
+	st := &State{TLS: &TLSHost{Host: "a.example.com"}, Hy2: &Hy2{Port: 5443, PubPort: 5443, HopStart: 20000, HopEnd: 21000}}
+	if !strings.Contains(linkHy2(st, "x"), "mport=20000-21000") || !strings.Contains(subClash(st), "20000-21000") {
+		t.Fatal("跳跃生效时链接里没带范围")
+	}
+	hopDown = true // hopApply 没加上规则
+	t.Cleanup(func() { hopDown = false })
+	if strings.Contains(linkHy2(st, "x"), "mport") || strings.Contains(subClash(st), "20000-21000") {
+		t.Fatal("跳跃规则没加上，链接或订阅里还带着范围")
+	}
+}
