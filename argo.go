@@ -97,17 +97,36 @@ func restoreCmd(bin, svc string) string {
 	if initSys != "systemd" {
 		restart = "rc-service " + svc + " restart"
 	}
-	return fmt.Sprintf("{ [ ! -e %[1]s ] || mv %[1]s %[1]s.bad.$(date +%%s); } && mv %[1]s.old %[1]s && %[2]s", bin, restart)
+	return fmt.Sprintf("{ { [ ! -e %[1]s ] && [ ! -L %[1]s ]; } || mv %[1]s %[1]s.bad.$(date +%%s); } && mv %[1]s.old %[1]s && %[2]s", bin, restart)
+}
+
+// 路径上有没有目录项，悬空的符号链接也算；查不了返回 error
+func present(p string) (bool, error) {
+	_, err := os.Lstat(p)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 // 更新前看有没有上次留下的 .old，返回原来有没有装、能不能接着更新。
 // 更新成功后 .old 会删掉，还在就说明上次失败了，交给人处理：不删、不更新，打出手动命令
 func prepOld(bin, svc string) (had, goOn bool) {
-	if exists(bin + ".old") {
+	old, err := present(bin + ".old")
+	if err != nil {
+		warn("查不了 %s.old: %v，这次不更新", bin, err)
+		return false, false
+	}
+	if old {
 		warn("%s.old 是上次更新失败留下的旧版本，这次不更新。确认要换回旧版本：%s；确认现在的能用：rm %s.old", bin, restoreCmd(bin, svc), bin)
 		return false, false
 	}
-	return exists(bin), true
+	had, err = present(bin)
+	if err != nil {
+		warn("查不了 %s: %v，这次不更新", bin, err)
+		return false, false
+	}
+	return had, true
 }
 
 // 测试里换掉，不真等

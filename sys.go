@@ -198,8 +198,12 @@ func svcEnable(name string) error {
 	return nil
 }
 
-// 停掉并取消开机启动。OpenRC 下 stop 报错时，只有 status 明确说 stopped 才算本来就停着
+// 停掉并取消开机启动。服务单元文件不存在、也没在跑，就当已经停好（比如只装了 Argo 的机器没有 dun-sb）；
+// OpenRC 下 stop 报错时，只有 status 明确说 stopped 才算本来就停着
 func svcDisable(name string) error {
+	if !svcExists(name) && !svcActive(name) {
+		return nil
+	}
 	if initSys == "systemd" {
 		return run("systemctl", "disable", "--now", name)
 	}

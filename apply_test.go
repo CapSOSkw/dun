@@ -897,46 +897,108 @@ func fakeArgoCF(t *testing.T) *int {
 	return &n
 }
 
-// 卸载最后一个协议 Argo 时停不掉：回滚后 die，不回收规则、不清 CF、不删 token，三份文件是旧字节
-func TestRemoveLastArgoStopFail(t *testing.T) {
-	r := fakeApply(t)
-	old := oldApplyState()
-	old.Reality, old.Hy2, old.TLS = nil, nil, nil
-	st0, sb0, xr0 := seedState(t, old)
-	cleaned := fakeArgoCF(t)
-	svcExists = func(string) bool { return true }
-	r.fail = func(c string, _ int) error {
-		if c == "systemctl disable --now dun-argo" {
-			return errors.New("exit 1")
-		}
-		return nil
+// 卸载最后一个协议 Argo：
+//   - 没有 dun-sb 单元（只装过 Argo）：不算停不掉，卸载成功，回收规则、清 CF
+//   - 单元在但停不掉：回滚后 die，不回收规则、不清 CF、不删 token，三份文件是旧字节
+func TestRemoveLastArgo(t *testing.T) {
+	for _, tc := range []struct {
+		name, failSvc string
+		noBox, ok     bool
+	}{
+		{"没有 dun-sb 单元", "dun-sb", true, true},
+		{"dun-sb 停不掉", "dun-sb", false, false},
+		{"dun-argo 停不掉", "dun-argo", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := fakeApply(t)
+			old := oldApplyState()
+			old.Reality, old.Hy2, old.TLS = nil, nil, nil
+			st0, sb0, xr0 := seedState(t, old)
+			cleaned := fakeArgoCF(t)
+			svcExists = func(n string) bool { return !(tc.noBox && n == svcBox) }
+			r.fail = func(c string, n int) error {
+				switch {
+				case c == "systemctl disable --now "+tc.failSvc && (tc.noBox || n == 1): // 没有单元时 systemd 也报 NoSuchUnit；回滚时能停
+					return errors.New("exit 1")
+				case tc.noBox && c == "systemctl is-active --quiet dun-sb":
+					return errors.New("inactive")
+				}
+				return nil
+			}
+			var died bool
+			out := captureStderr(func() {
+				defer func() { died = recover() != nil }()
+				removeArgo(loadState())
+			})
+			if tc.ok {
+				if died || r.prunes != 1 || *cleaned != 1 || exists(argoToken) || loadState().installed() {
+					t.Fatalf("应该卸载成功：die=%v prune=%d 清了 %d 次\n%s", died, r.prunes, *cleaned, out)
+				}
+				if r.has("systemctl disable --now dun-sb") != 0 {
+					t.Fatalf("没有单元不该去停：%q", r.cmds)
+				}
+				return
+			}
+			if !died || *cleaned != 0 || !exists(argoToken) {
+				t.Fatalf("停不掉应该 die，不清 CF、不删 token：die=%v 清了 %d 次\n%s", died, *cleaned, out)
+			}
+			assertRolledBack(t, r, out, st0, sb0, xr0)
+		})
 	}
-	var died bool
-	out := captureStderr(func() {
-		defer func() { died = recover() != nil }()
-		removeArgo(loadState())
-	})
-	if !died || *cleaned != 0 || !exists(argoToken) {
-		t.Fatalf("停不掉应该 die，不清 CF、不删 token：die=%v 清了 %d 次\n%s", died, *cleaned, out)
-	}
-	assertRolledBack(t, r, out, st0, sb0, xr0)
 }
 
-// 正向应用时旧跳跃规则删不掉（新规则加得上）：算失败，回滚，不回收规则
+// 正向应用时清旧跳跃规则：删不掉、列不出都算失败，回滚，不回收规则；没有 iptables 的机器跳过，照常成功
 func TestApplyNATClearFailForward(t *testing.T) {
-	r := fakeApply(t)
-	st0, sb0, xr0 := seedOld(t)
-	fakeFw(t, "-A PREROUTING -p udp -m udp --dport 20000:21000 -m comment --comment dun-hy2 -j REDIRECT --to-ports 5443",
-		func(a []string) bool { return a[2] == "-D" })
-	applyHop = hopRules
-	died, out := runApply(newApplyState())
-	if !died || !strings.Contains(out, "清旧的端口跳跃规则") {
-		t.Fatalf("旧规则删不掉应该回滚：\n%s", out)
+	for _, mode := range []string{"删不掉", "列不出", "没有 iptables"} {
+		t.Run(mode, func(t *testing.T) {
+			r := fakeApply(t)
+			st0, sb0, xr0 := seedOld(t)
+			fakeFw(t, "-A PREROUTING -p udp -m udp --dport 20000:21000 -m comment --comment dun-hy2 -j REDIRECT --to-ports 5443",
+				func(a []string) bool { return a[2] == "-D" })
+			switch mode {
+			case "列不出":
+				fwOut = func(string, ...string) (string, error) { return "", errors.New("nat table missing") }
+			case "没有 iptables":
+				fwHave = func(string) bool { return false }
+			}
+			applyHop = hopRules
+			st := newApplyState()
+			if mode == "没有 iptables" {
+				st.Hy2.HopStart, st.Hy2.HopEnd = 0, 0 // 没有 iptables 加不了跳跃
+			}
+			died, out := runApply(st)
+			if mode == "没有 iptables" {
+				if died || r.prunes != 1 {
+					t.Fatalf("没有 iptables 应该跳过清规则、照常成功：\n%s", out)
+				}
+				return
+			}
+			if !died || !strings.Contains(out, "清旧的端口跳跃规则") {
+				t.Fatalf("旧规则%s应该回滚：\n%s", mode, out)
+			}
+			assertBytes(t, "state.json", statePath, st0)
+			assertBytes(t, "sing-box 配置", sbConf, sb0)
+			assertBytes(t, "Xray 配置", xrayConf, xr0)
+			if r.prunes != 0 {
+				t.Fatal("没应用成功却回收了放行规则")
+			}
+		})
 	}
-	assertBytes(t, "state.json", statePath, st0)
-	assertBytes(t, "sing-box 配置", sbConf, sb0)
-	assertBytes(t, "Xray 配置", xrayConf, xr0)
-	if r.prunes != 0 {
-		t.Fatal("没应用成功却回收了放行规则")
+}
+
+// 上次留下的 .old 是悬空的符号链接：也算有残留，不更新、不删
+func TestPrepOldDanglingLink(t *testing.T) {
+	isolatePaths(t)
+	os.MkdirAll(cfdBin[:strings.LastIndex(cfdBin, "/")], 0755)
+	if err := os.Symlink(t.TempDir()+"/gone", cfdBin+".old"); err != nil {
+		t.Skipf("建不了符号链接：%v", err)
+	}
+	var had, goOn bool
+	out := captureStderr(func() { had, goOn = prepOld(cfdBin, svcArgo) })
+	if goOn || had || !strings.Contains(out, "这次不更新") {
+		t.Fatalf("悬空链接也该停下：had=%v goOn=%v\n%s", had, goOn, out)
+	}
+	if _, err := os.Lstat(cfdBin + ".old"); err != nil {
+		t.Fatalf(".old 链接不该被删：%v", err)
 	}
 }
