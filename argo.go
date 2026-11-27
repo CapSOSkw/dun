@@ -68,14 +68,18 @@ func placeBin(bin, name string, ver func(string) string) {
 		os.Remove(bin + ".new")
 		die("新下载的 %s 跑不起来，原来的没动", name)
 	}
-	had := exists(bin)
+	had, err := present(bin) // 悬空的符号链接也算原来有，一样挪成 .old、失败时换回
+	if err != nil {
+		os.Remove(bin + ".new")
+		die("查不了 %s，原来的没动: %v", bin, err)
+	}
 	if had {
 		if err := os.Rename(bin, bin+".old"); err != nil {
 			os.Remove(bin + ".new")
 			die("%s 换不上去，原来的没动: %v", name, err)
 		}
 	}
-	err := os.Rename(bin+".new", bin)
+	err = os.Rename(bin+".new", bin)
 	if err == nil && ver(bin) == "" {
 		err = fmt.Errorf("换上去跑不起来")
 	}
@@ -91,7 +95,7 @@ func placeBin(bin, name string, ver func(string) string) {
 	}
 }
 
-// 手动把 .old 换回去的命令：现在占着位置的（文件或目录）先挪成 .bad.<时间>，内容留着
+// 手动把 .old 换回去的命令：现在占着位置的（文件、目录、符号链接）先挪成 .bad.<时间>，内容留着
 func restoreCmd(bin, svc string) string {
 	restart := "systemctl restart " + svc
 	if initSys != "systemd" {
@@ -274,11 +278,9 @@ func xrayApply(st *State, changed bool) error {
 			errs = append(errs, fmt.Errorf("%s: %v", what, err))
 		}
 	}
-	if st.Argo == nil {
+	if st.Argo == nil { // 单元文件不在、也没在跑的，svcDisable 直接当已停好；文件不在但还在跑的照样要停
 		for _, s := range []string{svcArgo, svcXray} {
-			if svcExists(s) {
-				add(svcDisable(s), s+" 停不掉")
-			}
+			add(svcDisable(s), s+" 停不掉")
 		}
 		return errors.Join(errs...)
 	}
@@ -291,9 +293,7 @@ func xrayApply(st *State, changed bool) error {
 		add(svcDo(action, svcXray), "Xray 服务起不来")
 	}
 	if st.Argo.External { // 复用的隧道由这台机器上别的 cloudflared 在跑，dun 不再起一个
-		if svcExists(svcArgo) && svcActive(svcArgo) {
-			add(svcDisable(svcArgo), "dun-argo 停不掉")
-		}
+		add(svcDisable(svcArgo), "dun-argo 停不掉")
 		return errors.Join(errs...)
 	}
 	add(svcEnable(svcArgo), "cloudflared 设不了开机启动")

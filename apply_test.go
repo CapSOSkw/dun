@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -861,8 +862,9 @@ func TestReadStateErrors(t *testing.T) {
 
 // OpenRC：stop 报错时只有 status 明确是 stopped 才不算失败
 func TestSvcDisableOpenRC(t *testing.T) {
-	oi, orun, oout := initSys, run, runOut
-	t.Cleanup(func() { initSys, run, runOut = oi, orun, oout })
+	oi, orun, oout, oex := initSys, run, runOut, svcExists
+	t.Cleanup(func() { initSys, run, runOut, svcExists = oi, orun, oout, oex })
+	svcExists = func(string) bool { return true }
 	initSys = "openrc"
 	for _, tc := range []struct {
 		status string
@@ -902,12 +904,13 @@ func fakeArgoCF(t *testing.T) *int {
 //   - 单元在但停不掉：回滚后 die，不回收规则、不清 CF、不删 token，三份文件是旧字节
 func TestRemoveLastArgo(t *testing.T) {
 	for _, tc := range []struct {
-		name, failSvc string
-		noBox, ok     bool
+		name, failSvc        string
+		noBox, ok, noArgoSvc bool
 	}{
-		{"没有 dun-sb 单元", "dun-sb", true, true},
-		{"dun-sb 停不掉", "dun-sb", false, false},
-		{"dun-argo 停不掉", "dun-argo", false, false},
+		{"没有 dun-sb 单元", "dun-sb", true, true, false},
+		{"dun-sb 停不掉", "dun-sb", false, false, false},
+		{"dun-argo 停不掉", "dun-argo", false, false, false},
+		{"dun-argo 单元文件没了还在跑、停不掉", "dun-argo", false, false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := fakeApply(t)
@@ -915,7 +918,7 @@ func TestRemoveLastArgo(t *testing.T) {
 			old.Reality, old.Hy2, old.TLS = nil, nil, nil
 			st0, sb0, xr0 := seedState(t, old)
 			cleaned := fakeArgoCF(t)
-			svcExists = func(n string) bool { return !(tc.noBox && n == svcBox) }
+			svcExists = func(n string) bool { return !(tc.noBox && n == svcBox) && !(tc.noArgoSvc && n == svcArgo) }
 			r.fail = func(c string, n int) error {
 				switch {
 				case c == "systemctl disable --now "+tc.failSvc && (tc.noBox || n == 1): // 没有单元时 systemd 也报 NoSuchUnit；回滚时能停
@@ -1000,5 +1003,48 @@ func TestPrepOldDanglingLink(t *testing.T) {
 	}
 	if _, err := os.Lstat(cfdBin + ".old"); err != nil {
 		t.Fatalf(".old 链接不该被删：%v", err)
+	}
+}
+
+// 正式的 cloudflared 是悬空的符号链接、没有 .old：装新的时它也挪成 .old，重启失败后原链接换回来
+func TestUpdateCfdDanglingBin(t *testing.T) {
+	r := fakeApply(t)
+	fakeInstall(t)
+	osl, oin, oeof := sleep, in, eofIn
+	t.Cleanup(func() { sleep, in, eofIn = osl, oin, oeof })
+	sleep = func(time.Duration) {}
+	target := filepath.Join(t.TempDir(), "gone")
+	if err := os.Symlink(target, cfdBin); err != nil {
+		t.Skipf("建不了符号链接：%v", err)
+	}
+	ghLatest = func(string) string { return "2026.12.0" }
+	dlVerified = func(repo, tag, name, dst string, mode os.FileMode) error {
+		return os.WriteFile(dst, []byte("NEW"), mode)
+	}
+	runOut = func(name string, args ...string) (string, error) {
+		if _, err := os.ReadFile(name); err != nil {
+			return "", errors.New("not runnable")
+		}
+		return "cloudflared version 2026.12.0 (built 2026-11-01)", nil
+	}
+	r.fail = func(c string, n int) error {
+		if c == "systemctl restart dun-argo" && n == 1 {
+			return errors.New("exit 1")
+		}
+		return nil
+	}
+	in = bufio.NewReader(strings.NewReader("2\n"))
+	out := captureStderr(func() {
+		defer func() { recover() }()
+		updateCfd()
+	})
+	if got, err := os.Readlink(cfdBin); err != nil || got != target {
+		t.Fatalf("原来的链接没换回来：%q %v\n%s", got, err, out)
+	}
+	if ok, _ := present(cfdBin + ".old"); ok {
+		t.Fatal("换回去以后不该留 .old")
+	}
+	if r.has("systemctl restart dun-argo") != 2 {
+		t.Fatalf("回退后应该再重启一次：%q", r.cmds)
 	}
 }
