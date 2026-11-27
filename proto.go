@@ -374,9 +374,7 @@ func removeReality(st *State) {
 		warn("Reality 没装")
 		return
 	}
-	old := st.Reality.Port
 	st.Reality = nil
-	fwCloseUnused(st, fmt.Sprint(old), "tcp")
 	applyAll(st)
 	tlsHostRelease(st)
 	zoneRelease(st)
@@ -388,9 +386,7 @@ func removeAnyTLS(st *State) {
 		warn("AnyTLS 没装")
 		return
 	}
-	old := st.AnyTLS.Port
 	st.AnyTLS = nil
-	fwCloseUnused(st, fmt.Sprint(old), "tcp")
 	applyAll(st)
 	tlsHostRelease(st)
 	zoneRelease(st)
@@ -412,7 +408,6 @@ func removeWS(st *State) {
 		warn("没有 CF 凭据，%s 的解析和规则请自己去 CF 后台删", w.Host)
 	}
 	st.WS = nil
-	fwCloseUnused(st, fmt.Sprint(w.Port), "tcp")
 	applyAll(st)
 	if st.Argo == nil { // Argo 也用这份优选缓存
 		os.Remove(wetestPath)
@@ -494,13 +489,6 @@ func setHy2Range(h *Hy2, mode string) {
 	}
 }
 
-func hopRange(h *Hy2) string {
-	if h == nil || h.HopStart == 0 {
-		return ""
-	}
-	return fmt.Sprintf("%d:%d", h.HopStart, h.HopEnd)
-}
-
 // 端口跳跃靠 iptables 的 nat 规则把一段 UDP 转到 Hy2 端口。没有 iptables 就先装；
 // 装不上，或者容器不让加 nat 规则，就别分配跳跃范围，免得订阅里带着跳不过去的端口
 var hopUsable = func() bool {
@@ -555,12 +543,7 @@ func removeHy2(st *State) {
 		warn("Hysteria2 没装")
 		return
 	}
-	old, oldHop := st.Hy2.Port, hopRange(st.Hy2)
 	st.Hy2 = nil
-	fwCloseUnused(st, fmt.Sprint(old), "udp")
-	if oldHop != "" {
-		fwCloseUnused(st, oldHop, "udp")
-	}
 	applyAll(st)
 	tlsHostRelease(st)
 	zoneRelease(st)

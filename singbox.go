@@ -188,6 +188,7 @@ func applyAll(st *State) {
 		svcDisable(svcWeb)
 	}
 	if !st.installed() {
+		fwPrune(st)
 		info("没有协议了，服务已停")
 		return
 	}
@@ -216,6 +217,7 @@ func applyAll(st *State) {
 			bad = st.Hy2.Port
 		}
 		if bad == 0 {
+			fwPrune(st)
 			ok("服务已运行")
 			return
 		}
@@ -233,13 +235,13 @@ const hopTag = "dun-hy2"
 
 func hopClear() {
 	for _, bin := range []string{"iptables", "ip6tables"} {
-		if !have(bin) {
+		if !fwHave(bin) {
 			continue
 		}
-		out, _ := runOut(bin, "-t", "nat", "-S", "PREROUTING")
+		out, _ := fwOut(bin, "-t", "nat", "-S", "PREROUTING")
 		for _, l := range strings.Split(out, "\n") {
 			if strings.HasPrefix(l, "-A ") && strings.Contains(l, hopTag) {
-				run(bin, append([]string{"-t", "nat", "-D"}, strings.Fields(l)[1:]...)...)
+				fwCmd(bin, append([]string{"-t", "nat", "-D"}, strings.Fields(l)[1:]...)...)
 			}
 		}
 	}
@@ -256,13 +258,15 @@ func hopApply(st *State) {
 	need := map[string]bool{"iptables": st.IP4 != "" || st.IP6 == "", "ip6tables": st.IP6 != ""}
 	added := false
 	for _, bin := range []string{"iptables", "ip6tables"} {
-		if have(bin) && run(bin, "-t", "nat", "-A", "PREROUTING", "-p", "udp", "--dport", rng,
+		if fwHave(bin) && fwCmd(bin, "-t", "nat", "-A", "PREROUTING", "-p", "udp", "--dport", rng,
 			"-m", "comment", "--comment", hopTag, "-j", "REDIRECT", "--to-ports", fmt.Sprint(h.Port)) == nil && need[bin] {
 			added = true
 		}
 	}
-	hopDown = !added
 	if !added {
-		warn("端口跳跃规则加不上，只能用单端口 %d，链接和订阅里先不带跳跃范围", h.Port)
+		// 写回状态，所有进程（订阅、dun links、dun mihomo）都不再发跳不过去的范围
+		h.HopStart, h.HopEnd = 0, 0
+		st.save()
+		warn("端口跳跃规则加不上，已关掉跳跃，Hy2 走单端口 %d；以后能加了，进菜单 11 改 Hy2 端口时会重新开", h.Port)
 	}
 }

@@ -9,8 +9,6 @@ import (
 const (
 	baseDir     = "/etc/dun"
 	cfPath      = baseDir + "/cf.json"
-	sbBin       = baseDir + "/bin/sing-box"
-	sbConf      = baseDir + "/sing-box.json"
 	certDir     = baseDir + "/cert"
 	certFile    = certDir + "/fullchain.pem"
 	keyFile     = certDir + "/key.pem"
@@ -32,7 +30,11 @@ const (
 )
 
 // 测试里指到临时目录
-var statePath = baseDir + "/state.json"
+var (
+	statePath = baseDir + "/state.json"
+	sbBin     = baseDir + "/bin/sing-box"
+	sbConf    = baseDir + "/sing-box.json"
+)
 
 // dun upgrade 从这个仓库的 Release 拉新版本；发版时 workflow 会用 -X main.repo 注入当前仓库
 var repo = "CapSOSkw/dun"
@@ -91,12 +93,6 @@ type Hy2 struct {
 	HopEnd   int    `json:"hop_end,omitempty"`
 	HopSec   int    `json:"hop_sec"`
 }
-
-// hopApply 没加上跳跃规则时置位。订阅每次请求都重读状态，所以记在进程里，不存盘
-var hopDown bool
-
-// 跳跃规则真加上了才往链接和订阅里写范围
-func (h *Hy2) hopping() bool { return h.HopStart > 0 && !hopDown }
 
 type WS struct {
 	Host     string      `json:"host"`

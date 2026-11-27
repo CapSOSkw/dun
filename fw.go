@@ -319,14 +319,32 @@ func fwCleanup() {
 	}
 }
 
-// 单个协议卸载或换端口后，删掉旧端口的放行规则；别的协议还在用同一端口、协议就留着
-func fwCloseUnused(st *State, ps, proto string) {
-	if st.fwInUse(ps, proto) {
-		return
+// 回收不再用的放行规则：换掉的旧端口、卸掉的协议、关掉的跳跃范围；别的协议还在用同一端口、协议就留着。
+// 只在 applyAll 成功之后调用，用户中途取消或新配置没通过时，旧规则原样留着
+func fwPrune(st *State) {
+	stale := func(l string) bool {
+		if !fwTagged(l) {
+			return false
+		}
+		f := fwFields(l)
+		ps, proto := "", ""
+		for i := 0; i+1 < len(f); i++ {
+			switch f[i] {
+			case "-p":
+				proto = f[i+1]
+			case "--dport":
+				ps = f[i+1]
+			}
+		}
+		return ps != "" && !st.fwInUse(ps, proto)
 	}
-	rule := "-A INPUT " + strings.Join(fwSpec(ps, proto), " ")
 	for _, fam := range fwFamilies {
-		fwRemove(fam, func(l string) bool { return strings.Join(fwFields(l), " ") == rule })
+		// 这一族的 iptables 用不了（比如容器里没有 IPv6）就不管，免得每次应用都报错
+		if fwHave(fam.bin) {
+			if _, err := fwOut(fam.bin, "-S", "INPUT"); err == nil {
+				fwRemove(fam, stale)
+			}
+		}
 	}
 }
 

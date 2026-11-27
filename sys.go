@@ -484,9 +484,7 @@ func selectPortMode(st *State, addrs []net.Addr) string {
 func (st *State) setPortMode(mode string) {
 	st.PortMode = mode
 	if h := st.Hy2; h != nil && mode == portMapped && h.HopStart > 0 {
-		old := hopRange(h)
-		setHy2Range(h, mode)
-		fwCloseUnused(st, old, "udp")
+		setHy2Range(h, mode) // 只改内存，旧范围的放行规则等 applyAll 成功后由 fwPrune 回收
 	}
 }
 

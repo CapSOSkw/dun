@@ -30,8 +30,11 @@ func info(f string, a ...any) { fmt.Fprintf(os.Stderr, "\033[36m·\033[0m "+f+"\
 func warn(f string, a ...any) { fmt.Fprintf(os.Stderr, "\033[33m! "+f+"\033[0m\n", a...) }
 func die(f string, a ...any) {
 	fmt.Fprintf(os.Stderr, "\033[31m✗ "+f+"\033[0m\n", a...)
-	os.Exit(1)
+	dieExit(1)
 }
+
+var dieExit = os.Exit // 测试里换成 panic，好测 die 之后的分支
+
 func hr() { fmt.Fprintln(os.Stderr, strings.Repeat("─", 44)) }
 
 func ask(prompt, def string) string {

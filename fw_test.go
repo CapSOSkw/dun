@@ -123,6 +123,13 @@ func TestTrimLog(t *testing.T) {
 	}
 }
 
+// 测试一律不碰真实防火墙：没换替身的用例走到 iptables / ip6tables 都直接跳过，端口跳跃探测当作失败
+func TestMain(m *testing.M) {
+	fwHave = func(string) bool { return false }
+	hopUsable = func() bool { return false }
+	os.Exit(m.Run())
+}
+
 // 换上 iptables 替身：-S INPUT 返回 rules，fail 认出来的命令返回失败，其余成功；返回记下的命令
 func fakeFw(t *testing.T, rules string, fail func(args []string) bool) *[]string {
 	var cmds []string
@@ -191,29 +198,32 @@ func TestFwWriteRulesBackup(t *testing.T) {
 	}
 }
 
-func TestFwCloseUnused(t *testing.T) {
-	r443 := "-A INPUT -p tcp -m tcp --dport 443 -m comment --comment dun-allow -j ACCEPT"
-	r8443 := "-A INPUT -p tcp -m tcp --dport 8443 -m comment --comment dun-allow -j ACCEPT"
-	cmds := fakeFw(t, r443+"\n"+r8443, func([]string) bool { return false })
+// fakeRulesFile 把开机规则文件指到临时目录，内容是甲骨文规则加上 extra 几行放行
+func fakeRulesFile(t *testing.T, extra ...string) string {
 	p := t.TempDir() + "/rules.v4"
-	file := strings.Replace(ociRules, "-A INPUT -j REJECT", r443+"\n"+r8443+"\n-A INPUT -j REJECT", 1)
+	file := strings.Replace(ociRules, "-A INPUT -j REJECT", strings.Join(append(extra, "-A INPUT -j REJECT"), "\n"), 1)
 	os.WriteFile(p, []byte(file), 0640)
 	fwFamilies = []fwFamily{{"iptables", "iptables-restore", p}}
+	return p
+}
+
+func TestFwPrune(t *testing.T) {
+	r443 := "-A INPUT -p tcp -m tcp --dport 443 -m comment --comment dun-allow -j ACCEPT"
+	r8443 := "-A INPUT -p tcp -m tcp --dport 8443 -m comment --comment dun-allow -j ACCEPT"
+	hop := "-A INPUT -p udp -m udp --dport 20000:21000 -m comment --comment dun-allow -j ACCEPT"
+	cmds := fakeFw(t, r443+"\n"+r8443+"\n"+hop, func([]string) bool { return false })
+	p := fakeRulesFile(t, r443, r8443, hop)
 
 	st := &State{Reality: &Reality{Port: 443}, Hy2: &Hy2{Port: 443, HopStart: 20000, HopEnd: 21000}}
 	if !st.fwInUse("443", "tcp") || !st.fwInUse("20000:21000", "udp") || st.fwInUse("8443", "tcp") || st.fwInUse("8443", "udp") {
 		t.Fatal("端口占用判断不对")
 	}
-	fwCloseUnused(st, "443", "tcp") // Reality 还在用
-	if len(*cmds) != 0 {
-		t.Fatalf("端口还在用却删了规则：%q", *cmds)
-	}
-	fwCloseUnused(st, "8443", "tcp")
+	fwPrune(st) // 只有 8443 没人用了
 	if len(*cmds) != 1 || (*cmds)[0] != "-D"+r8443[2:] {
 		t.Fatalf("实时规则删得不对：%q", *cmds)
 	}
 	b, _ := os.ReadFile(p)
-	if strings.Contains(string(b), "8443") || !strings.Contains(string(b), r443) {
+	if strings.Contains(string(b), "8443") || !strings.Contains(string(b), r443) || !strings.Contains(string(b), hop) {
 		t.Fatalf("开机文件删得不对：\n%s", b)
 	}
 }

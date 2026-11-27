@@ -188,6 +188,9 @@ func serveSub(w http.ResponseWriter, clash bool) {
 func serve() {
 	detectOS()
 	st := loadState()
+	if st.Hy2 != nil {
+		hopApply(st) // 重启机器后 nat 表是空的，这里补上；加不上会改状态，所以排在开订阅监听之前
+	}
 	errs := make(chan error, 4)
 	if st.Reality != nil && st.TLS != nil {
 		ch := &certHolder{}
@@ -215,9 +218,6 @@ func serve() {
 				}))
 			}
 		}
-	}
-	if st.Hy2 != nil {
-		hopApply(st) // 重启机器后 nat 表是空的，这里补上
 	}
 	if st.WS != nil {
 		srv := &http.Server{Handler: siteHandler(st, true), ReadHeaderTimeout: 15 * time.Second, ErrorLog: quietLog}

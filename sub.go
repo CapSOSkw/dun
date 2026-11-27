@@ -297,7 +297,7 @@ func linkHy2(st *State, name string) string {
 	v.Set("sni", st.TLS.Host)
 	v.Set("obfs", "gecko")
 	v.Set("obfs-password", h.Obfs)
-	if h.hopping() {
+	if h.HopStart > 0 {
 		v.Set("mport", fmt.Sprintf("%d-%d", h.HopStart, h.HopEnd))
 	}
 	return fmt.Sprintf("hysteria2://%s@%s/?%s#%s", h.Password, hostPort(st.TLS.Host, h.PubPort), v.Encode(), frag(name))
@@ -415,7 +415,7 @@ func buildNodes(st *State) []node {
 	if h := st.Hy2; h != nil {
 		n := base + "-Hy2"
 		extra := ""
-		if h.hopping() {
+		if h.HopStart > 0 {
 			extra += fmt.Sprintf("    ports: %d-%d\n    hop-interval: %d\n", h.HopStart, h.HopEnd, h.HopSec)
 		}
 		extra += fmt.Sprintf("    obfs: gecko\n    obfs-password: %s\n    obfs-min-packet-size: %d\n    obfs-max-packet-size: %d\n",
