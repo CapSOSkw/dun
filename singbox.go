@@ -361,17 +361,14 @@ func applyAll(st *State) {
 	if err != nil {
 		fail(fmt.Errorf("写配置失败: %v", err))
 	}
-	err = startServices(st, xrChanged, false)
-	if !st.installed() { // 没有协议了：和以前一样，停服务出错只提示
-		if err != nil {
-			warn("%v", err)
-		}
+	// 没有协议了也一样：停不掉就回滚，调用者后面的清理（比如删 CF 上的隧道）不会再做
+	if err := startServices(st, xrChanged, false); err != nil {
+		fail(err)
+	}
+	if !st.installed() {
 		applyPrune(st)
 		info("没有协议了，服务已停")
 		return
-	}
-	if err != nil {
-		fail(err)
 	}
 	// 等端口起来再报成功
 	want := []int{}
@@ -438,15 +435,13 @@ func startServices(st *State, xrChanged, rollback bool) error {
 		add(svcEnable(svcBox), "sing-box 设不了开机启动")
 		add(svcDo("restart", svcBox), "sing-box 服务起不来")
 	}
-	// 正向应用时清旧规则出错只提示（有的容器列不出 nat 表，以前也不管）；回滚时如实汇总
+	// 旧规则列不出、删不掉都算失败（没有 iptables 的机器 hopClear 直接跳过）
 	clearErr, addErr := applyHop(st)
 	if rollback {
 		add(clearErr, "清掉新的端口跳跃规则")
 		add(addErr, "按原来的配置加端口跳跃")
 	} else {
-		if clearErr != nil {
-			warn("清旧的端口跳跃规则出错: %v", clearErr)
-		}
+		add(clearErr, "清旧的端口跳跃规则")
 		if addErr != nil {
 			add(hopOff(st), "关掉端口跳跃")
 		}

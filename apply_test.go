@@ -11,6 +11,53 @@ import (
 	"time"
 )
 
+// 部署目录下的路径都指到 dir，测试不碰真机上的 /etc/dun
+func setPaths(dir string) {
+	baseDir, cfPath, certDir = dir, dir+"/cf.json", dir+"/cert"
+	certFile, keyFile, acmeKeyPath = certDir+"/fullchain.pem", certDir+"/key.pem", dir+"/acme-account.key"
+	linksPath, customPath, wetestPath, argoToken = dir+"/links.txt", dir+"/cfip.txt", dir+"/cfip-wetest.json", dir+"/argo.token"
+	statePath, sbBin, sbConf = dir+"/state.json", dir+"/bin/sing-box", dir+"/sing-box.json"
+	xrayConf, xrayBin, cfdBin = dir+"/xray.json", dir+"/bin/xray", dir+"/bin/cloudflared"
+}
+
+// 本测试的部署目录换成 t.TempDir()，结束时还原
+func isolatePaths(t *testing.T) string {
+	t.Helper()
+	ps := []*string{&baseDir, &cfPath, &certDir, &certFile, &keyFile, &acmeKeyPath, &linksPath, &customPath,
+		&wetestPath, &argoToken, &statePath, &sbBin, &sbConf, &xrayConf, &xrayBin, &cfdBin}
+	old := make([]string, len(ps))
+	for i, p := range ps {
+		old[i] = *p
+	}
+	t.Cleanup(func() {
+		for i, p := range ps {
+			*p = old[i]
+		}
+	})
+	dir := t.TempDir()
+	setPaths(dir)
+	return dir
+}
+
+// 兜底：整个包的测试都不读真凭据、不联网、不碰部署目录；需要的测试自己换替身
+// 也不碰真实防火墙：没换替身的用例走到 iptables / ip6tables 都直接跳过，端口跳跃探测当作失败
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "dun-test-")
+	if err != nil {
+		panic(err)
+	}
+	setPaths(dir)
+	fwHave = func(string) bool { return false } // 不碰真机的 iptables
+	hopUsable = func() bool { return false }
+	ghLatest = func(string) string { return "" }
+	dlVerified = func(string, string, string, string, os.FileMode) error { return errors.New("测试里不联网") }
+	argoCF = func() *CF { return nil }
+	argoCFCleanup = func(*State, *CF, Argo) { panic("测试里不该清 CF") }
+	code := m.Run()
+	os.RemoveAll(dir)
+	os.Exit(code)
+}
+
 // applyAll 的替身：外部命令只记下来，不真跑 systemctl、sing-box、xray、iptables
 type applyRec struct {
 	cmds     []string               // run 跑过的命令（svcDo / svcEnable / svcDisable / svcActive）
@@ -29,16 +76,15 @@ func fakeApply(t *testing.T) *applyRec {
 	t.Helper()
 	r := &applyRec{writes: map[string]int{}, tcp: func(int) bool { return true }, udp: func(int) bool { return true },
 		check: func(string) error { return nil }}
-	ob, oc, ox, oxb, os_, oe, oi := sbBin, sbConf, xrayConf, xrayBin, statePath, dieExit, initSys
+	oe, oi := dieExit, initSys
 	orun, oout, oex := run, runOut, svcExists
 	opr, oudp, oprune, ohop, olog, owr, ow := portReady, udpReady, applyPrune, applyHop, applyLog, applyWrite, readyWait
 	t.Cleanup(func() {
-		sbBin, sbConf, xrayConf, xrayBin, statePath, dieExit, initSys = ob, oc, ox, oxb, os_, oe, oi
+		dieExit, initSys = oe, oi
 		run, runOut, svcExists = orun, oout, oex
 		portReady, udpReady, applyPrune, applyHop, applyLog, applyWrite, readyWait = opr, oudp, oprune, ohop, olog, owr, ow
 	})
-	dir := t.TempDir()
-	sbBin, sbConf, xrayConf, xrayBin, statePath = dir+"/sing-box", dir+"/sing-box.json", dir+"/xray.json", dir+"/xray", dir+"/state.json"
+	isolatePaths(t)
 	dieExit = func(int) { panic("die") }
 	initSys = "systemd"
 	svcExists = func(string) bool { return false }
@@ -111,7 +157,8 @@ func oldApplyState() *State {
 	return &State{IP4: "203.0.113.5", TLS: &TLSHost{Host: "n.r4nd.example.com"},
 		Reality: &Reality{Port: 8443, PubPort: 8443, Fallback: 21003},
 		Hy2:     &Hy2{Port: 5443, PubPort: 5443, Password: "p", Obfs: "o", HopStart: 20000, HopEnd: 21000, HopSec: 30},
-		Argo:    &Argo{Host: "a.example.com", Inner: 21010, Web: 21011, UUID: "u", Path: "/old"}}
+		Argo:    &Argo{Host: "a.example.com", Inner: 21010, Web: 21011, UUID: "u", Path: "/old"},
+		Zone:    &Zone{ID: "z", Name: "example.com"}}
 }
 
 // 新状态：Reality 换端口、Hy2 换跳跃范围、Argo 换路径（Xray 配置也要重写）
@@ -126,7 +173,12 @@ func newApplyState() *State {
 // 把旧状态、旧 sing-box 配置、旧 Xray 配置放到磁盘上，返回三份原字节
 func seedOld(t *testing.T) (st, sb, xr []byte) {
 	t.Helper()
-	oldApplyState().save()
+	return seedState(t, oldApplyState())
+}
+
+func seedState(t *testing.T, old *State) (st, sb, xr []byte) {
+	t.Helper()
+	old.save()
 	st, _ = os.ReadFile(statePath)
 	sb, xr = []byte(`{"old":"sing-box"}`), []byte(`{"old":"xray"}`)
 	os.WriteFile(sbConf, sb, 0600)
@@ -366,15 +418,26 @@ func TestApplyRollbackToEmpty(t *testing.T) {
 	}
 }
 
-// 卸到没有协议：和以前一样，停服务出错只提示，照样回收规则
-func TestApplyEmptyKeepsBaseline(t *testing.T) {
+// 卸到没有协议：停得掉就回收规则；停不掉也回滚，不回收规则
+func TestApplyEmpty(t *testing.T) {
 	r := fakeApply(t)
 	seedOld(t)
-	r.fail = func(string, int) error { return errors.New("exit 1") }
-	died, out := runApply(&State{})
-	if died || !strings.Contains(out, "没有协议了") || r.prunes != 1 {
-		t.Fatalf("空状态应该照旧停服务、回收规则：die=%v prune=%d\n%s", died, r.prunes, out)
+	if died, out := runApply(&State{}); died || !strings.Contains(out, "没有协议了") || r.prunes != 1 {
+		t.Fatalf("空状态应该停服务、回收规则：die=%v prune=%d\n%s", died, r.prunes, out)
 	}
+	r = fakeApply(t)
+	st0, sb0, xr0 := seedOld(t)
+	r.fail = func(c string, _ int) error {
+		if c == "systemctl disable --now dun" {
+			return errors.New("exit 1")
+		}
+		return nil
+	}
+	died, out := runApply(&State{})
+	if !died || !strings.Contains(out, "dun 服务停不掉") {
+		t.Fatalf("空状态停不掉也该回滚后 die：\n%s", out)
+	}
+	assertRolledBack(t, r, out, st0, sb0, xr0)
 }
 
 // 都起来了：新配置落盘，放行规则回收一次
@@ -468,7 +531,8 @@ func TestRollbackBinRenameFail(t *testing.T) {
 	os.MkdirAll(bin+"/busy", 0755) // bin 是个非空目录，.old 改不过去
 	os.WriteFile(bin+".old", []byte("OLD"), 0755)
 	out := captureStderr(func() { rollbackBin(bin, svcBox, true) })
-	if len(r.cmds) != 0 || !strings.Contains(out, "rm -rf "+bin+" && mv "+bin+".old "+bin+" && systemctl restart dun-sb") {
+	if len(r.cmds) != 0 || !strings.Contains(out, restoreCmd(bin, svcBox)) || !strings.Contains(restoreCmd(bin, svcBox),
+		"mv "+bin+" "+bin+".bad.$(date +%s); } && mv "+bin+".old "+bin+" && systemctl restart dun-sb") {
 		t.Fatalf("换不回去时不该重启，要给出手动命令：%q\n%s", r.cmds, out)
 	}
 	assertBytes(t, ".old", bin+".old", []byte("OLD"))
@@ -477,7 +541,7 @@ func TestRollbackBinRenameFail(t *testing.T) {
 // 菜单 15 更新 cloudflared 的回退：
 //   - 有原文件时换回去再重启
 //   - 原来没有时把新装的坏文件删掉，不重启
-//   - 现在的能跑才删上次留下的 .old；现在的跑不起来又有 .old，停下来提示先恢复，什么都不动
+//   - 有上次留下的 .old：不论现在的能不能跑，都不删、不下载，打出手动命令
 func TestUpdateCfdRollback(t *testing.T) {
 	for _, tc := range []struct {
 		name                string
@@ -490,9 +554,9 @@ func TestUpdateCfdRollback(t *testing.T) {
 		{"重启失败换回旧的", "OLD", "", true, false, "OLD", "", 2, true},
 		{"起来又停了换回旧的", "OLD", "", false, true, "OLD", "", 2, true},
 		{"首次装坏的删掉", "", "", false, true, "", "", 1, true},
-		{"能跑才删残留的 old", "OLD", "STALE", false, false, "NEW", "", 1, true},
-		{"跑不起来又有 old 先别更新", "BROKEN", "STALE", false, false, "BROKEN", "STALE", 0, false},
-		{"没装又有 old 先别更新", "", "STALE", false, false, "", "STALE", 0, false},
+		{"能跑也有 old 不更新", "OLD", "STALE", false, false, "OLD", "STALE", 0, false},
+		{"跑不起来又有 old 不更新", "BROKEN", "STALE", false, false, "BROKEN", "STALE", 0, false},
+		{"没装又有 old 不更新", "", "STALE", false, false, "", "STALE", 0, false},
 		{"成功", "OLD", "", false, false, "NEW", "", 1, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -543,7 +607,7 @@ func TestUpdateCfdRollback(t *testing.T) {
 			if r.has("systemctl restart dun-argo") != tc.restarts || downloaded != tc.downloaded {
 				t.Fatalf("重启 %d 次、下载 %v 不对：%q\n%s", r.has("systemctl restart dun-argo"), downloaded, r.cmds, out)
 			}
-			if !tc.downloaded && !strings.Contains(out, "先恢复再更新：rm -rf "+cfdBin+" && mv "+cfdBin+".old "+cfdBin) {
+			if !tc.downloaded && (!strings.Contains(out, "这次不更新") || !strings.Contains(out, restoreCmd(cfdBin, svcArgo))) {
 				t.Fatalf("没提示先恢复：\n%s", out)
 			}
 		})
@@ -681,9 +745,7 @@ func TestRemoveArgoStopInTxn(t *testing.T) {
 		t.Run(fmt.Sprint("停不掉=", fail), func(t *testing.T) {
 			r := fakeApply(t)
 			st0, sb0, xr0 := seedOld(t)
-			oin, oeof := in, eofIn
-			t.Cleanup(func() { in, eofIn = oin, oeof })
-			in = bufio.NewReader(strings.NewReader("y\n")) // 没有 CF 账号，确认继续
+			cleaned := fakeArgoCF(t)
 			svcExists = func(string) bool { return true }
 			checks := 0
 			r.check = func(string) error { checks++; return nil }
@@ -712,13 +774,13 @@ func TestRemoveArgoStopInTxn(t *testing.T) {
 				t.Fatalf("停隧道时新状态还没落盘，不在可回滚阶段：\n%s", stateAtStop)
 			}
 			if !fail {
-				if died || loadState().Argo != nil {
-					t.Fatalf("应该卸载成功：\n%s", out)
+				if died || loadState().Argo != nil || *cleaned != 1 || exists(argoToken) {
+					t.Fatalf("应该卸载成功并清掉 CF 和 token：清了 %d 次\n%s", *cleaned, out)
 				}
 				return
 			}
-			if !died || !strings.Contains(out, "dun-argo 停不掉") {
-				t.Fatalf("停不掉应该 die：\n%s", out)
+			if !died || !strings.Contains(out, "dun-argo 停不掉") || *cleaned != 0 || !exists(argoToken) {
+				t.Fatalf("停不掉应该 die，不清 CF、不删 token：清了 %d 次\n%s", *cleaned, out)
 			}
 			assertRolledBack(t, r, out, st0, sb0, xr0)
 		})
@@ -820,5 +882,61 @@ func TestSvcDisableOpenRC(t *testing.T) {
 		if err := svcDisable(svcBox); (err != nil) != tc.err {
 			t.Fatalf("status %q：错误 %v，应为 %v", tc.status, err, tc.err)
 		}
+	}
+}
+
+// 卸载 Argo 用的 CF：替身账号，清理只计数，不读真凭据、不发请求。顺手放一个 token 文件
+func fakeArgoCF(t *testing.T) *int {
+	t.Helper()
+	oc, ocl := argoCF, argoCFCleanup
+	t.Cleanup(func() { argoCF, argoCFCleanup = oc, ocl })
+	n := 0
+	argoCF = func() *CF { return &CF{} }
+	argoCFCleanup = func(*State, *CF, Argo) { n++ }
+	os.WriteFile(argoToken, []byte("tok"), 0600)
+	return &n
+}
+
+// 卸载最后一个协议 Argo 时停不掉：回滚后 die，不回收规则、不清 CF、不删 token，三份文件是旧字节
+func TestRemoveLastArgoStopFail(t *testing.T) {
+	r := fakeApply(t)
+	old := oldApplyState()
+	old.Reality, old.Hy2, old.TLS = nil, nil, nil
+	st0, sb0, xr0 := seedState(t, old)
+	cleaned := fakeArgoCF(t)
+	svcExists = func(string) bool { return true }
+	r.fail = func(c string, _ int) error {
+		if c == "systemctl disable --now dun-argo" {
+			return errors.New("exit 1")
+		}
+		return nil
+	}
+	var died bool
+	out := captureStderr(func() {
+		defer func() { died = recover() != nil }()
+		removeArgo(loadState())
+	})
+	if !died || *cleaned != 0 || !exists(argoToken) {
+		t.Fatalf("停不掉应该 die，不清 CF、不删 token：die=%v 清了 %d 次\n%s", died, *cleaned, out)
+	}
+	assertRolledBack(t, r, out, st0, sb0, xr0)
+}
+
+// 正向应用时旧跳跃规则删不掉（新规则加得上）：算失败，回滚，不回收规则
+func TestApplyNATClearFailForward(t *testing.T) {
+	r := fakeApply(t)
+	st0, sb0, xr0 := seedOld(t)
+	fakeFw(t, "-A PREROUTING -p udp -m udp --dport 20000:21000 -m comment --comment dun-hy2 -j REDIRECT --to-ports 5443",
+		func(a []string) bool { return a[2] == "-D" })
+	applyHop = hopRules
+	died, out := runApply(newApplyState())
+	if !died || !strings.Contains(out, "清旧的端口跳跃规则") {
+		t.Fatalf("旧规则删不掉应该回滚：\n%s", out)
+	}
+	assertBytes(t, "state.json", statePath, st0)
+	assertBytes(t, "sing-box 配置", sbConf, sb0)
+	assertBytes(t, "Xray 配置", xrayConf, xr0)
+	if r.prunes != 0 {
+		t.Fatal("没应用成功却回收了放行规则")
 	}
 }

@@ -502,12 +502,15 @@ func updateCore(st *State) {
 }
 
 func updateSingBox(st *State) {
+	had, goOn := prepOld(sbBin, svcBox)
+	if !goOn {
+		return
+	}
 	cur := sbVersion()
 	ver := pickVersion("sing-box", cur, sbPinned, ghLatest("SagerNet/sing-box"))
 	if ver == "" {
 		return
 	}
-	had := prepOld(sbBin, svcBox, sbVersionAt)
 	sbInstall(ver)
 	if _, n := sbConfig(st); n > 0 {
 		out, err := runOut(sbBin, "check", "-c", sbConf)

@@ -91,28 +91,23 @@ func placeBin(bin, name string, ver func(string) string) {
 	}
 }
 
-// 手动把 .old 换回去的命令；bin 是目录时也能用
+// 手动把 .old 换回去的命令：现在占着位置的（文件或目录）先挪成 .bad.<时间>，内容留着
 func restoreCmd(bin, svc string) string {
 	restart := "systemctl restart " + svc
 	if initSys != "systemd" {
 		restart = "rc-service " + svc + " restart"
 	}
-	return fmt.Sprintf("rm -rf %s && mv %s.old %s && %s", bin, bin, bin, restart)
+	return fmt.Sprintf("{ [ ! -e %[1]s ] || mv %[1]s %[1]s.bad.$(date +%%s); } && mv %[1]s.old %[1]s && %[2]s", bin, restart)
 }
 
-// 更新前处理上次留下的 .old，返回原来有没有装。
-// 现在的能跑才删 .old；现在的跑不起来又有 .old，说明上次没恢复完，先别更新，免得把唯一能用的旧版本删掉
-func prepOld(bin, svc string, ver func(string) string) bool {
-	if !exists(bin + ".old") {
-		return exists(bin)
+// 更新前看有没有上次留下的 .old，返回原来有没有装、能不能接着更新。
+// 更新成功后 .old 会删掉，还在就说明上次失败了，交给人处理：不删、不更新，打出手动命令
+func prepOld(bin, svc string) (had, goOn bool) {
+	if exists(bin + ".old") {
+		warn("%s.old 是上次更新失败留下的旧版本，这次不更新。确认要换回旧版本：%s；确认现在的能用：rm %s.old", bin, restoreCmd(bin, svc), bin)
+		return false, false
 	}
-	if ver(bin) == "" {
-		die("%s 跑不起来，%s.old 是上次留下的旧版本，先恢复再更新：%s", bin, bin, restoreCmd(bin, svc))
-	}
-	if err := os.Remove(bin + ".old"); err != nil {
-		die("删不掉上次留下的 %s.old，没更新: %v", bin, err)
-	}
-	return true
+	return exists(bin), true
 }
 
 // 测试里换掉，不真等
@@ -884,10 +879,7 @@ func removeArgo(st *State) {
 		return
 	}
 	a := *st.Argo
-	c := cfLoad()
-	if c != nil && c.Check() != nil {
-		c = nil
-	}
+	c := argoCF()
 	if (c == nil || st.Zone == nil) &&
 		!confirm("没有能用的 CF 账号，CF 上的解析、隧道和规则删不掉，得自己去后台删。还是继续卸载？", false) {
 		return
@@ -897,34 +889,7 @@ func removeArgo(st *State) {
 	st.Argo = nil
 	applyAll(st)
 	if c != nil && st.Zone != nil {
-		zid := st.Zone.ID
-		c.RuleRemove(zid, "http_config_settings", argoPrefix+a.Host)
-		c.RuleRemove(zid, "http_request_cache_settings", argoPrefix+a.Host)
-		if a.RecordID == "" && a.Tunnel != "" {
-			a.RecordID = argoRecord(st, c, &a)
-		}
-		dnsDrop(st, c, a.Host, a.RecordID, a.Backup)
-		acc, err := zoneAccount(st, c)
-		switch {
-		case err != nil:
-			warn("读不到 CF 账户 ID：%v。隧道 %s 请去 CF 后台处理", err, a.tunnelLabel())
-		case a.External || a.Manual:
-			// 不是 dun 建的隧道：只删 dun 加的路由，隧道和别的路由都留着
-			cfg, err := c.TunnelConfig(acc, a.Tunnel)
-			if err == nil {
-				err = c.TunnelConfigPut(acc, a.Tunnel, dropIngress(cfg, a.Host))
-			}
-			if err != nil {
-				warn("隧道 %s 里 %s 的路由没删掉：%v。去 CF 后台手动删", a.tunnelLabel(), a.Host, err)
-			} else {
-				info("隧道 %s 不是 dun 建的，只删了 %s 的路由，隧道留着", a.tunnelLabel(), a.Host)
-			}
-		case a.Tunnel != "":
-			if err := c.TunnelDelete(acc, a.Tunnel); err != nil {
-				warn("隧道没删掉：%v。去 CF 后台 Zero Trust → 网络 → Tunnels 手动删", err)
-			}
-		}
-		ok("已清理 %s 的解析、路由和 CF 规则", a.Host)
+		argoCFCleanup(st, c, a)
 	}
 	os.Remove(argoToken)
 	if st.WS == nil {
@@ -932,6 +897,47 @@ func removeArgo(st *State) {
 	}
 	zoneRelease(st)
 	ok("Argo 隧道已卸载")
+}
+
+// 卸载 Argo 用的 CF 账号，登不上返回 nil；测试里换掉，不读真凭据、不发请求
+var argoCF = func() *CF {
+	c := cfLoad()
+	if c != nil && c.Check() != nil {
+		return nil
+	}
+	return c
+}
+
+// 删 CF 上 Argo 的规则、解析、隧道或路由；测试里换掉
+var argoCFCleanup = func(st *State, c *CF, a Argo) {
+	zid := st.Zone.ID
+	c.RuleRemove(zid, "http_config_settings", argoPrefix+a.Host)
+	c.RuleRemove(zid, "http_request_cache_settings", argoPrefix+a.Host)
+	if a.RecordID == "" && a.Tunnel != "" {
+		a.RecordID = argoRecord(st, c, &a)
+	}
+	dnsDrop(st, c, a.Host, a.RecordID, a.Backup)
+	acc, err := zoneAccount(st, c)
+	switch {
+	case err != nil:
+		warn("读不到 CF 账户 ID：%v。隧道 %s 请去 CF 后台处理", err, a.tunnelLabel())
+	case a.External || a.Manual:
+		// 不是 dun 建的隧道：只删 dun 加的路由，隧道和别的路由都留着
+		cfg, err := c.TunnelConfig(acc, a.Tunnel)
+		if err == nil {
+			err = c.TunnelConfigPut(acc, a.Tunnel, dropIngress(cfg, a.Host))
+		}
+		if err != nil {
+			warn("隧道 %s 里 %s 的路由没删掉：%v。去 CF 后台手动删", a.tunnelLabel(), a.Host, err)
+		} else {
+			info("隧道 %s 不是 dun 建的，只删了 %s 的路由，隧道留着", a.tunnelLabel(), a.Host)
+		}
+	case a.Tunnel != "":
+		if err := c.TunnelDelete(acc, a.Tunnel); err != nil {
+			warn("隧道没删掉：%v。去 CF 后台 Zero Trust → 网络 → Tunnels 手动删", err)
+		}
+	}
+	ok("已清理 %s 的解析、路由和 CF 规则", a.Host)
 }
 
 func argoStatus(st *State) {
@@ -1023,12 +1029,15 @@ func runTunnel() {
 
 // ── 更新 ─────────────────────────────────────────────
 func updateXray() {
+	had, goOn := prepOld(xrayBin, svcXray)
+	if !goOn {
+		return
+	}
 	cur := xrayVersion()
 	ver := pickVersion("Xray", cur, xrayPinned, ghLatest("XTLS/Xray-core"))
 	if ver == "" {
 		return
 	}
-	had := prepOld(xrayBin, svcXray, xrayVersionAt)
 	xrayInstall(ver)
 	out, err := runOut(xrayBin, "run", "-test", "-c", xrayConf)
 	if err == nil {
@@ -1044,12 +1053,15 @@ func updateXray() {
 }
 
 func updateCfd() {
+	had, goOn := prepOld(cfdBin, svcArgo)
+	if !goOn {
+		return
+	}
 	cur := cfdVersion()
 	ver := pickVersion("cloudflared", cur, cfdPinned, ghLatest("cloudflare/cloudflared"))
 	if ver == "" {
 		return
 	}
-	had := prepOld(cfdBin, svcArgo, cfdVersionAt)
 	cfdInstall(ver)
 	if err := restartCheck(svcArgo, 3*time.Second); err != nil {
 		warn("新版本 cloudflared 跑不起来，回退到 %s: %v", cur, err)

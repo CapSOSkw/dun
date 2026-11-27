@@ -124,13 +124,6 @@ func TestTrimLog(t *testing.T) {
 	}
 }
 
-// 测试一律不碰真实防火墙：没换替身的用例走到 iptables / ip6tables 都直接跳过，端口跳跃探测当作失败
-func TestMain(m *testing.M) {
-	fwHave = func(string) bool { return false }
-	hopUsable = func() bool { return false }
-	os.Exit(m.Run())
-}
-
 // 换上 iptables 替身：-S INPUT 返回 rules，fail 认出来的命令返回失败，其余成功；返回记下的命令
 func fakeFw(t *testing.T, rules string, fail func(args []string) bool) *[]string {
 	var cmds []string

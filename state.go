@@ -8,6 +8,17 @@ import (
 )
 
 const (
+	selfPath   = "/usr/local/bin/dun"
+	svcBox     = "dun-sb"
+	svcWeb     = "dun"
+	rulePrefix = "dun ws "
+	svcXray    = "dun-xray"
+	svcArgo    = "dun-argo"
+	argoPrefix = "dun argo "
+)
+
+// 部署目录下的路径；测试里整体指到临时目录，不碰真机上的文件
+var (
 	baseDir     = "/etc/dun"
 	cfPath      = baseDir + "/cf.json"
 	certDir     = baseDir + "/cert"
@@ -17,24 +28,13 @@ const (
 	linksPath   = baseDir + "/links.txt"
 	customPath  = baseDir + "/cfip.txt"
 	wetestPath  = baseDir + "/cfip-wetest.json"
-	selfPath    = "/usr/local/bin/dun"
-	svcBox      = "dun-sb"
-	svcWeb      = "dun"
-	rulePrefix  = "dun ws "
 	argoToken   = baseDir + "/argo.token"
-	svcXray     = "dun-xray"
-	svcArgo     = "dun-argo"
-	argoPrefix  = "dun argo "
-)
-
-// 测试里指到临时目录
-var (
-	statePath = baseDir + "/state.json"
-	sbBin     = baseDir + "/bin/sing-box"
-	sbConf    = baseDir + "/sing-box.json"
-	xrayConf  = baseDir + "/xray.json"
-	xrayBin   = baseDir + "/bin/xray"
-	cfdBin    = baseDir + "/bin/cloudflared"
+	statePath   = baseDir + "/state.json"
+	sbBin       = baseDir + "/bin/sing-box"
+	sbConf      = baseDir + "/sing-box.json"
+	xrayConf    = baseDir + "/xray.json"
+	xrayBin     = baseDir + "/bin/xray"
+	cfdBin      = baseDir + "/bin/cloudflared"
 )
 
 // dun upgrade 从这个仓库的 Release 拉新版本；发版时 workflow 会用 -X main.repo 注入当前仓库
