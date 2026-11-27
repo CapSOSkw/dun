@@ -4,6 +4,8 @@
 
 dun 是一个 Go 写的单文件程序。节点由官方 sing-box 跑，Argo 的 XHTTP 由 Xray 跑、隧道由 cloudflared 跑，伪装站、订阅和证书续期由 dun 自己的后台服务负责。
 
+三个内核默认装验证过的固定版本：sing-box 1.14.5、Xray 26.11.9、cloudflared 2026.11.2，不跟着上游最新版走。想换新版本，进菜单 15「更新内核」自己选。
+
 > 本仓库 fork 自 [byJoey/dun](https://github.com/byJoey/dun)，在它的基础上加了 Argo 隧道。
 
 ## 快速开始
@@ -145,7 +147,7 @@ VPS 不开任何公网端口，也不暴露 IP，IP 被墙了照样能用；NAT 
 | 11 / 12 | 改端口，重置密码和 UUID |
 | 13 | 卸载单个协议，顺带删掉它的解析、CF 规则和隧道 |
 | 14 | 重启、停止、看日志 |
-| 15 / 20 | 更新内核（sing-box，装了 Argo 还有 Xray、cloudflared），更新 dun |
+| 15 / 20 | 更新内核（sing-box，装了 Argo 还有 Xray、cloudflared）：列出当前版本、推荐版本和上游最新正式版，自己选装哪个，新版本跑不起来自动换回旧的；更新 dun |
 | 16 | 开 BBR |
 | 17 | IP 变了，同步解析 |
 | 18 | 更换节点域名，证书一起换 |

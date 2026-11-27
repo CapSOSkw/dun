@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand/v2"
@@ -44,11 +45,12 @@ func have(c string) bool   { _, err := exec.LookPath(c); return err == nil }
 func isDir(p string) bool  { fi, err := os.Stat(p); return err == nil && fi.IsDir() }
 func exists(p string) bool { _, err := os.Stat(p); return err == nil }
 
-func run(name string, args ...string) error {
+// 跑外部命令；测试里换成替身，不真跑 systemctl、sing-box
+var run = func(name string, args ...string) error {
 	return exec.Command(name, args...).Run()
 }
 
-func runOut(name string, args ...string) (string, error) {
+var runOut = func(name string, args ...string) (string, error) {
 	b, err := exec.Command(name, args...).CombinedOutput()
 	return strings.TrimSpace(string(b)), err
 }
@@ -185,21 +187,36 @@ func svcDo(action, name string) error {
 	return run("rc-service", name, action)
 }
 
-func svcEnable(name string) {
+// OpenRC 的开机项是 /etc/runlevels/default 下的链接。已经加过、本来就没加时 rc-update 也会报错，以链接为准
+func svcEnable(name string) error {
 	if initSys == "systemd" {
-		run("systemctl", "enable", name)
-	} else {
-		run("rc-update", "add", name, "default")
+		return run("systemctl", "enable", name)
 	}
+	if err := run("rc-update", "add", name, "default"); err != nil && !exists("/etc/runlevels/default/"+name) {
+		return err
+	}
+	return nil
 }
 
-func svcDisable(name string) {
-	if initSys == "systemd" {
-		run("systemctl", "disable", "--now", name)
-	} else {
-		run("rc-service", name, "stop")
-		run("rc-update", "del", name, "default")
+// 停掉并取消开机启动。服务单元文件不存在、也没在跑，就当已经停好（比如只装了 Argo 的机器没有 dun-sb）；
+// OpenRC 下 stop 报错时，只有 status 明确说 stopped 才算本来就停着
+func svcDisable(name string) error {
+	if !svcExists(name) && !svcActive(name) {
+		return nil
 	}
+	if initSys == "systemd" {
+		return run("systemctl", "disable", "--now", name)
+	}
+	var errs []error
+	if err := run("rc-service", name, "stop"); err != nil {
+		if out, _ := runOut("rc-service", name, "status"); !strings.Contains(out, "stopped") {
+			errs = append(errs, err)
+		}
+	}
+	if err := run("rc-update", "del", name, "default"); err != nil && exists("/etc/runlevels/default/"+name) {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 func svcActive(name string) bool {

@@ -2,11 +2,23 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 )
 
 const (
+	selfPath   = "/usr/local/bin/dun"
+	svcBox     = "dun-sb"
+	svcWeb     = "dun"
+	rulePrefix = "dun ws "
+	svcXray    = "dun-xray"
+	svcArgo    = "dun-argo"
+	argoPrefix = "dun argo "
+)
+
+// 部署目录下的路径；测试里整体指到临时目录，不碰真机上的文件
+var (
 	baseDir     = "/etc/dun"
 	cfPath      = baseDir + "/cf.json"
 	certDir     = baseDir + "/cert"
@@ -16,24 +28,13 @@ const (
 	linksPath   = baseDir + "/links.txt"
 	customPath  = baseDir + "/cfip.txt"
 	wetestPath  = baseDir + "/cfip-wetest.json"
-	selfPath    = "/usr/local/bin/dun"
-	svcBox      = "dun-sb"
-	svcWeb      = "dun"
-	rulePrefix  = "dun ws "
-	xrayBin     = baseDir + "/bin/xray"
-	xrayConf    = baseDir + "/xray.json"
-	cfdBin      = baseDir + "/bin/cloudflared"
 	argoToken   = baseDir + "/argo.token"
-	svcXray     = "dun-xray"
-	svcArgo     = "dun-argo"
-	argoPrefix  = "dun argo "
-)
-
-// 测试里指到临时目录
-var (
-	statePath = baseDir + "/state.json"
-	sbBin     = baseDir + "/bin/sing-box"
-	sbConf    = baseDir + "/sing-box.json"
+	statePath   = baseDir + "/state.json"
+	sbBin       = baseDir + "/bin/sing-box"
+	sbConf      = baseDir + "/sing-box.json"
+	xrayConf    = baseDir + "/xray.json"
+	xrayBin     = baseDir + "/bin/xray"
+	cfdBin      = baseDir + "/bin/cloudflared"
 )
 
 // dun upgrade 从这个仓库的 Release 拉新版本；发版时 workflow 会用 -X main.repo 注入当前仓库
@@ -180,20 +181,39 @@ type State struct {
 }
 
 func loadState() *State {
-	st := &State{}
-	if b, err := os.ReadFile(statePath); err == nil {
-		if err := json.Unmarshal(b, st); err != nil {
-			die("状态文件 %s 损坏: %v", statePath, err)
-		}
+	st, err := readState()
+	if err != nil {
+		die("%v", err)
 	}
 	return st
 }
 
+// 和 loadState 一样，出错返回 error 不退出。文件不存在 = 还没装，返回空状态；读不了、解析不了都是错误
+func readState() (*State, error) {
+	st := &State{}
+	b, err := os.ReadFile(statePath)
+	if os.IsNotExist(err) {
+		return st, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("读不了状态文件 %s: %v", statePath, err)
+	}
+	if err := json.Unmarshal(b, st); err != nil {
+		return nil, fmt.Errorf("状态文件 %s 损坏: %v", statePath, err)
+	}
+	return st, nil
+}
+
 func (s *State) save() {
-	b, _ := json.MarshalIndent(s, "", "  ")
-	if err := writeFileAtomic(statePath, b, 0600); err != nil {
+	if err := s.write(); err != nil {
 		die("保存状态失败: %v", err)
 	}
+}
+
+// 和 save 一样，出错返回 error 不退出
+func (s *State) write() error {
+	b, _ := json.MarshalIndent(s, "", "  ")
+	return writeFileAtomic(statePath, b, 0600)
 }
 
 func (s *State) installed() bool {

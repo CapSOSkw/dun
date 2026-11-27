@@ -2,10 +2,10 @@ package main
 
 import (
 	"archive/zip"
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -42,22 +42,125 @@ func binVersion(bin string, field int, args ...string) string {
 }
 
 // 第一行形如 Xray 26.11.9 (Xray, Penetrates Everything.) ...
-func xrayVersion() string { return binVersion(xrayBin, 1, "version") }
+func xrayVersionAt(bin string) string { return binVersion(bin, 1, "version") }
+func xrayVersion() string             { return xrayVersionAt(xrayBin) }
 
 // 第一行形如 cloudflared version 2026.11.2 (built ...)
-func cfdVersion() string { return binVersion(cfdBin, 2, "--version") }
+func cfdVersionAt(bin string) string { return binVersion(bin, 2, "--version") }
+func cfdVersion() string             { return cfdVersionAt(cfdBin) }
 
-// 新文件先放在 .new；换上去跑不起来就换回旧的。旧的留成 .old，更新失败时回退用
-func placeBin(bin, name string, ver func() string) {
-	if exists(bin) {
-		os.Rename(bin, bin+".old")
+// 重启服务，等一会儿看还在不在跑
+func restartCheck(svc string, wait time.Duration) error {
+	if err := svcDo("restart", svc); err != nil {
+		return err
 	}
-	os.Rename(bin+".new", bin)
-	if ver() == "" {
+	sleep(wait)
+	if !svcActive(svc) {
+		return fmt.Errorf("%s 重启后没在运行", svc)
+	}
+	return nil
+}
+
+// 新文件先放在 .new，自己能跑才换上去，跑不起来就删掉，原来的不动；
+// 换上去以后跑不起来就换回旧的。旧的留成 .old，更新后服务起不来时回退用。
+// 已经有 .old（上次失败留下的备份）就不换，免得把它覆盖掉；菜单更新和启动时的自动补装都走这里
+func placeBin(bin, svc, name string, ver func(string) string) {
+	if old, err := present(bin + ".old"); old || err != nil {
+		os.Remove(bin + ".new")
+		die("%s.old 是上次留下的备份（或者查不了: %v），这次不换 %s。手动处理：%s；确认现在的能用：rm %s.old", bin, err, name, restoreCmd(bin, svc), bin)
+	}
+	if ver(bin+".new") == "" {
+		os.Remove(bin + ".new")
+		die("新下载的 %s 跑不起来，原来的没动", name)
+	}
+	had, err := present(bin) // 悬空的符号链接也算原来有，一样挪成 .old、失败时换回
+	if err != nil {
+		os.Remove(bin + ".new")
+		die("查不了 %s，原来的没动: %v", bin, err)
+	}
+	if had {
+		if err := os.Rename(bin, bin+".old"); err != nil {
+			os.Remove(bin + ".new")
+			die("%s 换不上去，原来的没动: %v", name, err)
+		}
+	}
+	err = os.Rename(bin+".new", bin)
+	if err == nil && ver(bin) == "" {
+		err = fmt.Errorf("换上去跑不起来")
+	}
+	if err != nil {
+		os.Remove(bin + ".new")
 		os.Remove(bin)
-		os.Rename(bin+".old", bin)
-		die("%s 跑不起来", name)
+		if had {
+			if rerr := os.Rename(bin+".old", bin); rerr != nil {
+				warn("换回原来的 %s 失败，手动把 %s.old 改回 %s: %v", name, bin, bin, rerr)
+			}
+		}
+		die("%s %v，已换回原来的", name, err)
 	}
+}
+
+// 手动把 .old 换回去的命令：现在占着位置的（文件、目录、符号链接）先挪成 .bad.<时间>，内容留着
+func restoreCmd(bin, svc string) string {
+	restart := "systemctl restart " + svc
+	if initSys != "systemd" {
+		restart = "rc-service " + svc + " restart"
+	}
+	return fmt.Sprintf("{ { [ ! -e %[1]s ] && [ ! -L %[1]s ]; } || mv %[1]s %[1]s.bad.$(date +%%s); } && mv %[1]s.old %[1]s && %[2]s", bin, restart)
+}
+
+// 路径上有没有目录项，悬空的符号链接也算；查不了返回 error
+func present(p string) (bool, error) {
+	_, err := os.Lstat(p)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+// 更新前看有没有上次留下的 .old，返回原来有没有装、能不能接着更新。
+// 更新成功后 .old 会删掉，还在就说明上次失败了，交给人处理：不删、不更新，打出手动命令
+func prepOld(bin, svc string) (had, goOn bool) {
+	old, err := present(bin + ".old")
+	if err != nil {
+		warn("查不了 %s.old: %v，这次不更新", bin, err)
+		return false, false
+	}
+	if old {
+		warn("%s.old 是上次更新失败留下的旧版本，这次不更新。确认要换回旧版本：%s；确认现在的能用：rm %s.old", bin, restoreCmd(bin, svc), bin)
+		return false, false
+	}
+	had, err = present(bin)
+	if err != nil {
+		warn("查不了 %s: %v，这次不更新", bin, err)
+		return false, false
+	}
+	return had, true
+}
+
+// 测试里换掉，不真等
+var sleep = time.Sleep
+
+// 更新后服务起不来：换回 .old 再重启。原来没有装就把新的删掉，不留在正式路径上；
+// 换不回去时不重启，免得再起一次坏的
+func rollbackBin(bin, svc string, had bool) {
+	if !had {
+		if err := os.Remove(bin); err != nil {
+			warn("原来没有装 %s，新装的也删不掉: %v，手动删掉它", bin, err)
+			return
+		}
+		warn("原来没有装 %s，新装的跑不起来，已删掉", bin)
+		return
+	}
+	if err := os.Rename(bin+".old", bin); err != nil {
+		warn("换回旧版本失败: %v。%s 没有重启，手动恢复：%s", err, svc, restoreCmd(bin, svc))
+		return
+	}
+	if err := svcDo("restart", svc); err != nil {
+		warn("已换回旧版本，但 %s 重启失败: %v，看看日志", svc, err)
+		return
+	}
+	ok("已换回旧版本")
 }
 
 func unzipOne(zf, name, dst string) error {
@@ -90,10 +193,7 @@ func unzipOne(zf, name, dst string) error {
 
 func xrayInstall(ver string) {
 	if ver == "" {
-		ver = ghLatest("XTLS/Xray-core")
-	}
-	if ver == "" {
-		die("拿不到 Xray 最新版本号，检查能不能访问 GitHub")
+		ver = xrayPinned
 	}
 	arch := map[string]string{"amd64": "64", "arm64": "arm64-v8a"}[runtime.GOARCH]
 	if arch == "" {
@@ -103,32 +203,30 @@ func xrayInstall(ver string) {
 	os.MkdirAll(path.Dir(xrayBin), 0755)
 	zf := xrayBin + ".zip"
 	defer os.Remove(zf)
-	if err := downloadVerified("XTLS/Xray-core", "v"+ver, "Xray-linux-"+arch+".zip", zf, 0600); err != nil {
+	if err := dlVerified("XTLS/Xray-core", "v"+ver, "Xray-linux-"+arch+".zip", zf, 0600); err != nil {
 		die("Xray 下载失败: %v", err)
 	}
 	if err := unzipOne(zf, "xray", xrayBin+".new"); err != nil {
+		os.Remove(xrayBin + ".new")
 		die("Xray 包解不开: %v", err)
 	}
-	placeBin(xrayBin, "Xray", xrayVersion)
+	placeBin(xrayBin, svcXray, "Xray", xrayVersionAt)
 	ok("Xray %s", xrayVersion())
 }
 
 func cfdInstall(ver string) {
 	if ver == "" {
-		ver = ghLatest("cloudflare/cloudflared")
-	}
-	if ver == "" {
-		die("拿不到 cloudflared 最新版本号，检查能不能访问 GitHub")
+		ver = cfdPinned
 	}
 	if runtime.GOARCH != "amd64" && runtime.GOARCH != "arm64" {
 		die("cloudflared 暂不支持 %s", runtime.GOARCH)
 	}
 	info("下载 cloudflared %s", ver)
 	os.MkdirAll(path.Dir(cfdBin), 0755)
-	if err := downloadVerified("cloudflare/cloudflared", ver, "cloudflared-linux-"+runtime.GOARCH, cfdBin+".new", 0755); err != nil {
+	if err := dlVerified("cloudflare/cloudflared", ver, "cloudflared-linux-"+runtime.GOARCH, cfdBin+".new", 0755); err != nil {
 		die("cloudflared 下载失败: %v", err)
 	}
-	placeBin(cfdBin, "cloudflared", cfdVersion)
+	placeBin(cfdBin, svcArgo, "cloudflared", cfdVersionAt)
 	ok("cloudflared %s", cfdVersion())
 }
 
@@ -172,46 +270,42 @@ func xrayConfig(st *State) map[string]any {
 	}
 }
 
-func svcExists(name string) bool {
+var svcExists = func(name string) bool { // 测试里换掉
 	return exists("/etc/systemd/system/"+name+".service") || exists("/etc/init.d/"+name)
 }
 
-// 由 applyAll 调用。Xray 配置先检查再替换，没变就不重启，免得 Argo 节点断线；
-// cloudflared 的路由在 CF 上，平时也不用重启它
-func xrayApply(st *State) {
-	if st.Argo == nil {
-		for _, s := range []string{svcArgo, svcXray} {
-			if svcExists(s) {
-				svcDisable(s)
-			}
+// 由 applyAll 调用，Xray 配置已经检查过、换好了。配置没变就不重启，免得 Argo 节点断线；
+// cloudflared 的路由在 CF 上，平时也不用重启它。一步出错也接着做完，错误汇总返回
+func xrayApply(st *State, changed bool) error {
+	var errs []error
+	add := func(err error, what string) {
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %v", what, err))
 		}
-		return
 	}
-	b, _ := json.MarshalIndent(xrayConfig(st), "", "  ")
-	if cur, _ := os.ReadFile(xrayConf); !bytes.Equal(cur, b) {
-		tmp := baseDir + "/xray.check.json" // Xray 按扩展名认格式，得是 .json
-		os.WriteFile(tmp, b, 0600)
-		if out, err := runOut(xrayBin, "run", "-test", "-c", tmp); err != nil {
-			os.Remove(tmp)
-			die("Xray 配置检查不通过，旧配置没动:\n%s", out)
+	if st.Argo == nil { // 单元文件不在、也没在跑的，svcDisable 直接当已停好；文件不在但还在跑的照样要停
+		for _, s := range []string{svcArgo, svcXray} {
+			add(svcDisable(s), s+" 停不掉")
 		}
-		os.Rename(tmp, xrayConf)
-		svcEnable(svcXray)
-		svcDo("restart", svcXray)
-	} else if !svcActive(svcXray) {
-		svcEnable(svcXray)
-		svcDo("start", svcXray)
+		return errors.Join(errs...)
+	}
+	if changed || !svcActive(svcXray) {
+		add(svcEnable(svcXray), "Xray 设不了开机启动")
+		action := "start"
+		if changed {
+			action = "restart"
+		}
+		add(svcDo(action, svcXray), "Xray 服务起不来")
 	}
 	if st.Argo.External { // 复用的隧道由这台机器上别的 cloudflared 在跑，dun 不再起一个
-		if svcExists(svcArgo) && svcActive(svcArgo) {
-			svcDisable(svcArgo)
-		}
-		return
+		add(svcDisable(svcArgo), "dun-argo 停不掉")
+		return errors.Join(errs...)
 	}
-	svcEnable(svcArgo)
+	add(svcEnable(svcArgo), "cloudflared 设不了开机启动")
 	if !svcActive(svcArgo) {
-		svcDo("start", svcArgo)
+		add(svcDo("start", svcArgo), "cloudflared 服务起不来")
 	}
+	return errors.Join(errs...)
 }
 
 // ── 隧道 ─────────────────────────────────────────────
@@ -252,7 +346,13 @@ func zoneAccount(st *State, c *CF) (string, error) {
 	acc, err := c.ZoneAccount(st.Zone.ID)
 	if err == nil {
 		st.Zone.Account = acc
-		st.save()
+		// 只把账户 ID 写回磁盘，别把调用者还没应用的改动（比如刚换的 Argo UUID、路径）提前存进去
+		if cur, rerr := readState(); rerr == nil && cur.Zone != nil && cur.Zone.ID == st.Zone.ID {
+			cur.Zone.Account = acc
+			if werr := cur.write(); werr != nil {
+				warn("CF 账户 ID 没存上，下次用到时再查: %v", werr)
+			}
+		}
 	}
 	return acc, err
 }
@@ -761,7 +861,9 @@ func installArgo(st *State) {
 			die("保存隧道 token 失败: %v", err)
 		}
 	}
-	// 下面开始动 CF 上的路由和解析。先把状态（含原有解析的备份）存下来，中途断了也能用「卸载 Argo」收拾干净
+	// 下面开始动 CF 上的路由和解析。先把状态（含原有解析的备份）存下来，中途断了也能用「卸载 Argo」收拾干净。
+	// 这里和下面那次保存都在 applyAll 的预检之前，是故意的：预检不过时 state.json 里留着 Argo，
+	// 才能在菜单里卸载 Argo，清掉 CF 上已经建好的隧道和解析
 	ensureToken(st)
 	st.Argo = a
 	st.save()
@@ -780,7 +882,7 @@ func installArgo(st *State) {
 	} else {
 		argoDashboardRoute(st, c, a)
 	}
-	st.save()
+	st.save() // 记下解析的记录 ID，原因见上
 	argoRules(st, c)
 	applyAll(st)
 	argoWait(st, c)
@@ -801,56 +903,65 @@ func removeArgo(st *State) {
 		return
 	}
 	a := *st.Argo
-	c := cfLoad()
-	if c != nil && c.Check() != nil {
-		c = nil
-	}
+	c := argoCF()
 	if (c == nil || st.Zone == nil) &&
 		!confirm("没有能用的 CF 账号，CF 上的解析、隧道和规则删不掉，得自己去后台删。还是继续卸载？", false) {
 		return
 	}
-	// 先停隧道（隧道上还挂着连接就删不掉），CF 上清理完再改状态，中途断了还能重来
-	for _, s := range []string{svcArgo, svcXray} {
-		svcDisable(s)
-	}
-	if c != nil && st.Zone != nil {
-		zid := st.Zone.ID
-		c.RuleRemove(zid, "http_config_settings", argoPrefix+a.Host)
-		c.RuleRemove(zid, "http_request_cache_settings", argoPrefix+a.Host)
-		if a.RecordID == "" && a.Tunnel != "" {
-			a.RecordID = argoRecord(st, c, &a)
-		}
-		dnsDrop(st, c, a.Host, a.RecordID, a.Backup)
-		acc, err := zoneAccount(st, c)
-		switch {
-		case err != nil:
-			warn("读不到 CF 账户 ID：%v。隧道 %s 请去 CF 后台处理", err, a.tunnelLabel())
-		case a.External || a.Manual:
-			// 不是 dun 建的隧道：只删 dun 加的路由，隧道和别的路由都留着
-			cfg, err := c.TunnelConfig(acc, a.Tunnel)
-			if err == nil {
-				err = c.TunnelConfigPut(acc, a.Tunnel, dropIngress(cfg, a.Host))
-			}
-			if err != nil {
-				warn("隧道 %s 里 %s 的路由没删掉：%v。去 CF 后台手动删", a.tunnelLabel(), a.Host, err)
-			} else {
-				info("隧道 %s 不是 dun 建的，只删了 %s 的路由，隧道留着", a.tunnelLabel(), a.Host)
-			}
-		case a.Tunnel != "":
-			if err := c.TunnelDelete(acc, a.Tunnel); err != nil {
-				warn("隧道没删掉：%v。去 CF 后台 Zero Trust → 网络 → Tunnels 手动删", err)
-			}
-		}
-		ok("已清理 %s 的解析、路由和 CF 规则", a.Host)
-	}
+	// 先按卸掉 Argo 的状态应用：预检不过什么都不动；停 Xray 和隧道（隧道上还挂着连接就删不掉）
+	// 在 applyAll 可回滚的阶段里做，失败会换回原来的配置、把服务起回来。成功后再清 CF 上的东西
 	st.Argo = nil
 	applyAll(st)
+	if c != nil && st.Zone != nil {
+		argoCFCleanup(st, c, a)
+	}
 	os.Remove(argoToken)
 	if st.WS == nil {
 		os.Remove(wetestPath)
 	}
 	zoneRelease(st)
 	ok("Argo 隧道已卸载")
+}
+
+// 卸载 Argo 用的 CF 账号，登不上返回 nil；测试里换掉，不读真凭据、不发请求
+var argoCF = func() *CF {
+	c := cfLoad()
+	if c != nil && c.Check() != nil {
+		return nil
+	}
+	return c
+}
+
+// 删 CF 上 Argo 的规则、解析、隧道或路由；测试里换掉
+var argoCFCleanup = func(st *State, c *CF, a Argo) {
+	zid := st.Zone.ID
+	c.RuleRemove(zid, "http_config_settings", argoPrefix+a.Host)
+	c.RuleRemove(zid, "http_request_cache_settings", argoPrefix+a.Host)
+	if a.RecordID == "" && a.Tunnel != "" {
+		a.RecordID = argoRecord(st, c, &a)
+	}
+	dnsDrop(st, c, a.Host, a.RecordID, a.Backup)
+	acc, err := zoneAccount(st, c)
+	switch {
+	case err != nil:
+		warn("读不到 CF 账户 ID：%v。隧道 %s 请去 CF 后台处理", err, a.tunnelLabel())
+	case a.External || a.Manual:
+		// 不是 dun 建的隧道：只删 dun 加的路由，隧道和别的路由都留着
+		cfg, err := c.TunnelConfig(acc, a.Tunnel)
+		if err == nil {
+			err = c.TunnelConfigPut(acc, a.Tunnel, dropIngress(cfg, a.Host))
+		}
+		if err != nil {
+			warn("隧道 %s 里 %s 的路由没删掉：%v。去 CF 后台手动删", a.tunnelLabel(), a.Host, err)
+		} else {
+			info("隧道 %s 不是 dun 建的，只删了 %s 的路由，隧道留着", a.tunnelLabel(), a.Host)
+		}
+	case a.Tunnel != "":
+		if err := c.TunnelDelete(acc, a.Tunnel); err != nil {
+			warn("隧道没删掉：%v。去 CF 后台 Zero Trust → 网络 → Tunnels 手动删", err)
+		}
+	}
+	ok("已清理 %s 的解析、路由和 CF 规则", a.Host)
 }
 
 func argoStatus(st *State) {
@@ -942,48 +1053,45 @@ func runTunnel() {
 
 // ── 更新 ─────────────────────────────────────────────
 func updateXray() {
-	cur, latest := xrayVersion(), ghLatest("XTLS/Xray-core")
-	if latest == "" {
-		warn("拿不到 Xray 最新版本号")
+	had, goOn := prepOld(xrayBin, svcXray)
+	if !goOn {
 		return
 	}
-	if cur == latest && !confirm("Xray 已经是最新 "+cur+"，还要重装？", false) {
+	cur := xrayVersion()
+	ver := pickVersion("Xray", cur, xrayPinned, ghLatest("XTLS/Xray-core"))
+	if ver == "" {
 		return
 	}
-	xrayInstall(latest)
+	xrayInstall(ver)
 	out, err := runOut(xrayBin, "run", "-test", "-c", xrayConf)
 	if err == nil {
-		svcDo("restart", svcXray)
-		time.Sleep(2 * time.Second)
+		err = restartCheck(svcXray, 2*time.Second)
 	}
-	if err != nil || !svcActive(svcXray) {
-		warn("新版本 Xray 跑不起来，回退到 %s\n%s", cur, out)
-		os.Rename(xrayBin+".old", xrayBin)
-		svcDo("restart", svcXray)
+	if err != nil {
+		warn("新版本 Xray 跑不起来，回退到 %s: %v\n%s", cur, err, out)
+		rollbackBin(xrayBin, svcXray, had)
 		return
 	}
 	os.Remove(xrayBin + ".old")
-	ok("Xray 已更新到 %s", latest)
+	ok("Xray 已更新到 %s", ver)
 }
 
 func updateCfd() {
-	cur, latest := cfdVersion(), ghLatest("cloudflare/cloudflared")
-	if latest == "" {
-		warn("拿不到 cloudflared 最新版本号")
+	had, goOn := prepOld(cfdBin, svcArgo)
+	if !goOn {
 		return
 	}
-	if cur == latest && !confirm("cloudflared 已经是最新 "+cur+"，还要重装？", false) {
+	cur := cfdVersion()
+	ver := pickVersion("cloudflared", cur, cfdPinned, ghLatest("cloudflare/cloudflared"))
+	if ver == "" {
 		return
 	}
-	cfdInstall(latest)
-	svcDo("restart", svcArgo)
-	time.Sleep(3 * time.Second)
-	if !svcActive(svcArgo) {
-		warn("新版本 cloudflared 跑不起来，回退到 %s", cur)
-		os.Rename(cfdBin+".old", cfdBin)
-		svcDo("restart", svcArgo)
+	cfdInstall(ver)
+	if err := restartCheck(svcArgo, 3*time.Second); err != nil {
+		warn("新版本 cloudflared 跑不起来，回退到 %s: %v", cur, err)
+		rollbackBin(cfdBin, svcArgo, had)
 		return
 	}
 	os.Remove(cfdBin + ".old")
-	ok("cloudflared 已更新到 %s", latest)
+	ok("cloudflared 已更新到 %s", ver)
 }

@@ -692,21 +692,17 @@ func TestInstallUDPFresh(t *testing.T) {
 }
 
 // 真走 removeTUIC / removeHy2：另一个协议的端口、跳跃范围、密码在内存和磁盘上都不变。
-// 测试里没有 sing-box，applyAll 在配置检查处 die（换成 panic）；之后的重启、等端口、回收规则要真服务，跑不了
+// 外部命令换成替身（apply_test.go 的 fakeApply），applyAll 走完整条成功路径，新状态落盘
 func TestRemoveOneUDPKeepsOther(t *testing.T) {
-	ob, oc, os_, oe := sbBin, sbConf, statePath, dieExit
-	t.Cleanup(func() { sbBin, sbConf, statePath, dieExit = ob, oc, os_, oe })
-	dir := t.TempDir()
-	sbBin, sbConf, statePath = dir+"/no-sing-box", dir+"/sing-box.json", dir+"/state.json"
-	dieExit = func(int) { panic("die") }
+	fakeApply(t)
 	remove := func(f func(*State), st *State) {
 		var r any
 		out := captureStderr(func() {
 			defer func() { r = recover() }()
 			f(st)
 		})
-		if r == nil || !strings.Contains(out, "sing-box 配置检查不通过") {
-			t.Fatalf("应该停在 sing-box 配置检查处：%v\n%s", r, out)
+		if r != nil || !strings.Contains(out, "服务已运行") {
+			t.Fatalf("应该卸载成功：%v\n%s", r, out)
 		}
 	}
 
