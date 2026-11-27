@@ -14,7 +14,7 @@ import (
 
 func protoLabel(k string) string {
 	return map[string]string{"reality": "Reality 偷自己", "anytls": "AnyTLS", "ws": "CF WS", "hy2": "Hysteria2",
-		"argo": "Argo 隧道"}[k]
+		"tuic": "TUIC v5", "argo": "Argo 隧道"}[k]
 }
 
 func pickProto(st *State) string {
@@ -30,6 +30,9 @@ func pickProto(st *State) string {
 	}
 	if st.Hy2 != nil {
 		ks = append(ks, "hy2")
+	}
+	if st.TUIC != nil {
+		ks = append(ks, "tuic")
 	}
 	if st.Argo != nil {
 		ks = append(ks, "argo")
@@ -63,6 +66,8 @@ func showLinks(st *State) {
 		b.WriteString("【订阅】v2rayN / Shadowrocket / NekoBox / 小火箭\n" + base + "/sub\n\n")
 		b.WriteString("【订阅】Clash Verge / FlClash / mihomo\n" + base + "/clash\n\n")
 		qrs = append(qrs, base+"/sub")
+	} else {
+		b.WriteString("【订阅】没有在线订阅：它由 Reality 偷自己、CF WS 或 Argo 隧道的域名提供。只装 Hy2 / TUIC 时导入下面的单个链接，Clash 配置用 dun mihomo 导出\n\n")
 	}
 	base := nodeName()
 	if st.Reality != nil {
@@ -110,6 +115,13 @@ func showLinks(st *State) {
 		b.WriteString("\n")
 		qrs = append(qrs, l)
 	}
+	if st.TUIC != nil {
+		l := linkTUIC(st, base+"-TUIC")
+		b.WriteString("【TUIC v5】UDP（QUIC），bbr 拥塞控制，线路差的机器用\n" + l + "\n")
+		b.WriteString("Mihomo / Clash Verge Rev / FlClash、v2rayN、Shadowrocket、Stash、SFA 都能用；v2rayNG 稳定版的常规入口暂时没有 TUIC\n")
+		b.WriteString(fmt.Sprintf("云安全组（比如 Azure NSG）要放行 UDP %d\n\n", st.TUIC.PubPort))
+		qrs = append(qrs, l)
+	}
 
 	writeFileAtomic(linksPath, []byte(b.String()), 0600)
 	hr()
@@ -151,8 +163,8 @@ func changePort(st *State) {
 	}
 	oldPort, oldPub := curPorts(st, k)
 	var port int
-	if k == "hy2" {
-		port = askUDPPort(st, oldPort)
+	if k == "hy2" || k == "tuic" {
+		port = askUDPPort(st, k, oldPort)
 	} else {
 		port = askPort(st, protoLabel(k)+" 新端口", oldPort, k)
 	}
@@ -162,18 +174,28 @@ func changePort(st *State) {
 	if st.PortMode == portMapped && port == oldPort && oldPub > 0 {
 		pub = oldPub
 	}
-	pub = askPubPort(st, pub)
+	if k == "hy2" || k == "tuic" {
+		port, pub = askUDPPub(st, k, port, pub)
+	} else {
+		pub = askPubPort(st, pub)
+	}
 	switch k {
 	case "hy2":
 		st.Hy2.Port, st.Hy2.PubPort = port, pub
 		fwOpenProto(fmt.Sprint(port), "udp")
-		setHy2Range(st.Hy2, st.PortMode)
+		setHy2Range(st.Hy2, st.PortMode, st.tuicPorts()...)
 		if st.Hy2.HopStart > 0 {
 			fwOpenProto(fmt.Sprintf("%d:%d", st.Hy2.HopStart, st.Hy2.HopEnd), "udp")
 			info("云安全组请放行 UDP %d 和 %d-%d", pub, st.Hy2.HopStart, st.Hy2.HopEnd)
 		}
 		applyAll(st)
 		ok("Hy2 监听 UDP %d，外网端口 %d", port, pub)
+		return
+	case "tuic":
+		st.TUIC.Port, st.TUIC.PubPort = port, pub
+		fwOpenProto(fmt.Sprint(port), "udp")
+		applyAll(st)
+		ok("TUIC 监听 UDP %d，外网端口 %d；云安全组请放行 UDP %d", port, pub, pub)
 		return
 
 	case "reality":
@@ -210,6 +232,8 @@ func resetSecret(st *State) {
 		fresh := newHy2(st.Hy2.Port, st.Hy2.PubPort)
 		fresh.HopStart, fresh.HopEnd = st.Hy2.HopStart, st.Hy2.HopEnd
 		st.Hy2 = fresh
+	case "tuic":
+		st.TUIC.UUID, st.TUIC.Password = newUUID(), randLabel(32)
 	case "argo":
 		st.Argo.UUID, st.Argo.Path = newUUID(), "/"+randLabel(10)
 		// 隧道路由按路径把 XHTTP 分给 Xray，路径换了要同步；同步不上也能用，会经 dun 转一手
@@ -228,7 +252,7 @@ func removeOne(st *State) {
 		return
 	}
 	map[string]func(*State){"reality": removeReality, "anytls": removeAnyTLS, "ws": removeWS,
-		"hy2": removeHy2, "argo": removeArgo}[k](st)
+		"hy2": removeHy2, "tuic": removeTUIC, "argo": removeArgo}[k](st)
 }
 
 func serviceMenu() {
@@ -541,6 +565,9 @@ func uninstallAll(st *State) {
 	if st.Hy2 != nil {
 		removeHy2(st)
 	}
+	if st.TUIC != nil {
+		removeTUIC(st)
+	}
 	if st.WS != nil {
 		removeWS(st)
 	}
@@ -603,11 +630,14 @@ func statusLine(st *State) {
 			h += fmt.Sprintf("（跳跃 %d-%d）", st.Hy2.HopStart, st.Hy2.HopEnd)
 		}
 	}
-	g := ""
+	t, g := "", ""
+	if st.TUIC != nil {
+		t = fmt.Sprintf("UDP %d", st.TUIC.Port)
+	}
 	if st.Argo != nil {
 		g = st.Argo.Host
 	}
-	fmt.Printf("  Hysteria2: %s   Argo 隧道: %s\n", p(st.Hy2 != nil, h), p(st.Argo != nil, g))
+	fmt.Printf("  Hysteria2: %s   TUIC v5: %s   Argo 隧道: %s\n", p(st.Hy2 != nil, h), p(st.TUIC != nil, t), p(st.Argo != nil, g))
 	if st.TLS != nil {
 		fmt.Printf("  节点域名: %s\n", st.TLS.Host)
 	}
@@ -630,7 +660,7 @@ func menu(st *State) {
   2. 安装 AnyTLS
   3. 安装 CF WS（套 Cloudflare）
   4. 三个一起装
-  5. 安装 Hysteria2（UDP，线路差的机器用）
+  5. 安装 HY2 | TUIC5（UDP，线路差的机器用）
   6. Argo 隧道（VLESS + XHTTP，VPS 不开端口）
 ────────────────────────────────────────────
   7. 查看订阅和节点链接
@@ -666,7 +696,7 @@ func menu(st *State) {
 			installWS(st)
 			showLinks(st)
 		case "5":
-			installHy2(st)
+			installUDP(st)
 			showLinks(st)
 		case "6":
 			argoMenu(st)

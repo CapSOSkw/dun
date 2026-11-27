@@ -211,7 +211,7 @@ func wsRules(st *State, c *CF) {
 	}
 }
 
-// 偷自己、AnyTLS、Hysteria2 共用一个只解析、不走 CF 代理的子域名。
+// 偷自己、AnyTLS、Hysteria2、TUIC 共用一个只解析、不走 CF 代理的子域名。
 // 证书签成 *.<随机>.<域名>：证书公开日志里只有通配符，扫描器拿不到真正的节点域名
 func pickTLSHost(st *State, c *CF) *TLSHost {
 	mid := randLabel(5) + "." + st.Zone.Name
@@ -226,7 +226,7 @@ func tlsHostEnsure(st *State) {
 	if st.TLS == nil {
 		cfPickZone(st, c)
 		fmt.Fprintln(os.Stderr)
-		info("Reality 偷自己、AnyTLS、Hysteria2 共用一个子域名，只做解析，不开 CF 代理")
+		info("Reality 偷自己、AnyTLS、Hysteria2、TUIC 共用一个子域名，只做解析，不开 CF 代理")
 		st.TLS = pickTLSHost(st, c)
 		st.save()
 	}
@@ -416,12 +416,15 @@ func removeWS(st *State) {
 	ok("CF WS 已卸载")
 }
 
-// UDP 端口里找一段没人用的
-func freeUDPRange(width int) (int, int) {
+// UDP 端口里找一段没人用的；avoid 是本脚本别的 UDP 协议（TUIC）的端口，还没起来时 /proc 里查不到
+func freeUDPRange(width int, avoid ...int) (int, int) {
 	busy := map[int]bool{}
-	for _, f := range []string{"/proc/net/udp", "/proc/net/udp6"} {
-		b, _ := os.ReadFile(f)
-		for i, line := range strings.Split(string(b), "\n") {
+	for _, p := range avoid {
+		busy[p] = true
+	}
+	for _, f := range []string{"udp", "udp6"} {
+		b, _ := os.ReadFile(procDir + "/net/" + f)
+		for i, line := range strings.Split(string(b), "\n") { // 不看状态：未连接（07）和已连接（01）的都算占用
 			fs := strings.Fields(line)
 			if i == 0 || len(fs) < 4 {
 				continue
@@ -444,21 +447,64 @@ func freeUDPRange(width int) (int, int) {
 	return 0, 0
 }
 
-func askUDPPort(st *State, def int) int {
+// UDP 端口 p 是不是分给了本脚本 key 以外的 UDP 协议。Hy2 的整个跳跃范围都算：
+// REDIRECT 占着的端口在 /proc/net/udp 里查不到，可发到那里的包都会被转给 Hy2
+func (st *State) udpTaken(p int, key string) bool {
+	if h := st.Hy2; h != nil && key != "hy2" && (p == h.Port || (h.HopStart > 0 && p >= h.HopStart && p <= h.HopEnd)) {
+		return true
+	}
+	return st.TUIC != nil && key != "tuic" && p == st.TUIC.Port
+}
+
+// 已装 TUIC 的监听端口和外网端口，算 Hy2 跳跃范围时都要避开：端口方式从映射切到直连后，TUIC 可能还留着映射的外网端口
+func (st *State) tuicPorts() []int {
+	if st.TUIC == nil {
+		return nil
+	}
+	return []int{st.TUIC.Port, st.TUIC.PubPort}
+}
+
+func askUDPPort(st *State, key string, def int) int {
 	for {
-		p := askInt("Hysteria2 监听端口（UDP）", def, 1, 65535)
+		p := askInt(protoLabel(key)+" 监听端口（UDP）", def, 1, 65535)
+		if st.udpTaken(p, key) {
+			reask("UDP %d 已经分给本脚本的其他协议了（Hy2 的跳跃范围也算）", p)
+			continue
+		}
 		if o := udpOwner(p); o != "" && o != "ours" {
-			warn("UDP %d 被 %s 占用，换一个", p, o)
+			reask("UDP %d 被 %s 占用，换一个", p, o)
 			continue
 		}
 		return p
 	}
 }
 
-func randUDPPort() int {
+// 问外网端口（def 是默认值），返回监听端口和外网端口。两个 UDP 协议的外网端口不能重，否则链接指到同一个公网端口。
+// 端口方式是全局的，可能刚从映射切到直连：直连时外网端口就是监听端口，撞了另一个协议留着的外网端口就得换监听端口
+func askUDPPub(st *State, key string, port, def int) (int, int) {
+	for {
+		pub := askPubPort(st, def)
+		if !st.udpPubTaken(pub, key) {
+			return port, pub
+		}
+		reask("外网 UDP %d 已经分给本脚本的其他协议了，换一个", pub)
+		if st.PortMode != portMapped {
+			port = askUDPPort(st, key, port)
+			def = port
+		}
+	}
+}
+
+// 外网端口撞了另一个 UDP 协议的监听端口、外网端口或 Hy2 跳跃范围
+func (st *State) udpPubTaken(pub int, key string) bool {
+	return st.udpTaken(pub, key) || (st.Hy2 != nil && key != "hy2" && pub == st.Hy2.PubPort) ||
+		(st.TUIC != nil && key != "tuic" && pub == st.TUIC.PubPort)
+}
+
+func randUDPPort(st *State, key string) int {
 	for i := 0; i < 100; i++ {
 		p := 20000 + mrand.IntN(40000)
-		if udpOwner(p) == "" {
+		if udpOwner(p) == "" && !st.udpTaken(p, key) {
 			return p
 		}
 	}
@@ -476,7 +522,7 @@ func newHy2(port, pub int) *Hy2 {
 	return h
 }
 
-func setHy2Range(h *Hy2, mode string) {
+func setHy2Range(h *Hy2, mode string, avoid ...int) {
 	switch {
 	case mode == portMapped:
 		h.HopStart, h.HopEnd = 0, 0
@@ -485,7 +531,7 @@ func setHy2Range(h *Hy2, mode string) {
 		h.HopStart, h.HopEnd = 0, 0
 		warn("这台机器加不了 iptables 的端口转发规则，Hy2 走单端口")
 	case h.HopStart == 0:
-		h.HopStart, h.HopEnd = freeUDPRange(r2(2000, 6000))
+		h.HopStart, h.HopEnd = freeUDPRange(r2(2000, 6000), avoid...)
 	}
 }
 
@@ -513,15 +559,15 @@ var hopUsable = func() bool {
 
 func installHy2(st *State) {
 	if st.Hy2 != nil {
-		warn("Hysteria2 已经装过了，改端口、换密码走管理菜单")
+		warn("Hysteria2 已经装过了，跳过；改端口、换密码走管理菜单")
 		return
 	}
 	hr()
 	info("安装 Hysteria2：gecko 混淆 + 端口跳跃，参数每台机器随机")
-	port := askUDPPort(st, randUDPPort())
-	pub := askPubPort(st, port)
+	port := askUDPPort(st, "hy2", randUDPPort(st, "hy2"))
+	port, pub := askUDPPub(st, "hy2", port, port)
 	h := newHy2(port, pub)
-	setHy2Range(h, st.PortMode)
+	setHy2Range(h, st.PortMode, st.tuicPorts()...)
 	tlsHostEnsure(st)
 	st.Hy2 = h
 	fwOpenProto(fmt.Sprint(port), "udp")
@@ -536,6 +582,42 @@ func installHy2(st *State) {
 	info("甲骨文、谷歌云、AWS 这类机器，云后台的安全组要放行 UDP")
 }
 
+// 不开 0-RTT：会被重放。拥塞控制用 bbr，丢包多的线路上比默认的 cubic 快
+func installTUIC(st *State) {
+	if st.TUIC != nil {
+		warn("TUIC v5 已经装过了，跳过；改端口、换密码走管理菜单")
+		return
+	}
+	hr()
+	info("安装 TUIC v5（QUIC），和 Hy2 共用节点域名和证书，端口各用各的")
+	port := askUDPPort(st, "tuic", randUDPPort(st, "tuic"))
+	port, pub := askUDPPub(st, "tuic", port, port)
+	tlsHostEnsure(st)
+	st.TUIC = &TUIC{Port: port, PubPort: pub, UUID: newUUID(), Password: randLabel(32), CC: "bbr"}
+	fwOpenProto(fmt.Sprint(port), "udp")
+	applyAll(st)
+	ok("TUIC v5 安装完成")
+	info("云后台有安全组的（甲骨文、AWS、Azure NSG 这类），要放行 UDP %d", pub)
+}
+
+// 菜单「安装 HY2 | TUIC5」的选项，和 udpPlan 一一对应
+var udpChoices = []string{"一起安装 HY2 + TUIC5（默认，直接回车）", "仅安装 HY2", "仅安装 TUIC5"}
+
+func udpPlan(i int) []string { return [][]string{{"hy2", "tuic"}, {"hy2"}, {"tuic"}}[i] }
+
+var udpInstallers = map[string]func(*State){"hy2": installHy2, "tuic": installTUIC} // 测试里换成记录调用的替身
+
+// 已经装了的那个由 installHy2 / installTUIC 自己提示跳过，凭据和端口不动
+func installUDP(st *State) {
+	i := choose(udpChoices, 1)
+	if i < 0 {
+		return
+	}
+	for _, k := range udpPlan(i) {
+		udpInstallers[k](st)
+	}
+}
+
 func r2(a, b int) int { return a + mrand.IntN(b-a+1) }
 
 func removeHy2(st *State) {
@@ -548,4 +630,16 @@ func removeHy2(st *State) {
 	tlsHostRelease(st)
 	zoneRelease(st)
 	ok("Hysteria2 已卸载")
+}
+
+func removeTUIC(st *State) {
+	if st.TUIC == nil {
+		warn("TUIC v5 没装")
+		return
+	}
+	st.TUIC = nil
+	applyAll(st)
+	tlsHostRelease(st)
+	zoneRelease(st)
+	ok("TUIC v5 已卸载")
 }

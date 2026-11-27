@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -285,21 +286,29 @@ func trimLog(p string, max, keep int64) {
 // ── 端口 ─────────────────────────────────────────────
 func listenInodes(port int) []string { return sockInodes(port, false) }
 
-// UDP 没有监听状态，未连接的套接字是 07
-func sockInodes(port int, udp bool) []string {
-	files, state := []string{"/proc/net/tcp", "/proc/net/tcp6"}, "0A"
+var procDir = "/proc" // 测试里指到临时目录
+
+// UDP 没有监听状态：未连接的套接字是 07，绑了端口再 connect 的是 01，都占着端口。states 不填就是这两种（TCP 是 0A）
+func sockInodes(port int, udp bool, states ...string) []string {
+	files := []string{"tcp", "tcp6"}
 	if udp {
-		files, state = []string{"/proc/net/udp", "/proc/net/udp6"}, "07"
+		files = []string{"udp", "udp6"}
+	}
+	if len(states) == 0 {
+		states = []string{"0A"}
+		if udp {
+			states = []string{"07", "01"}
+		}
 	}
 	var res []string
 	for _, f := range files {
-		b, err := os.ReadFile(f)
+		b, err := os.ReadFile(procDir + "/net/" + f)
 		if err != nil {
 			continue
 		}
 		for i, line := range strings.Split(string(b), "\n") {
 			fs := strings.Fields(line)
-			if i == 0 || len(fs) < 10 || fs[3] != state {
+			if i == 0 || len(fs) < 10 || !slices.Contains(states, fs[3]) {
 				continue
 			}
 			idx := strings.LastIndex(fs[1], ":")
@@ -314,6 +323,12 @@ func sockInodes(port int, udp bool) []string {
 // 返回占用端口的进程名；空 = 空闲，ours = 本程序或它管的 sing-box
 func portOwner(port int) string { return sockOwner(port, false) }
 func udpOwner(port int) string  { return sockOwner(port, true) }
+
+// applyAll 的就绪检查：本脚本的进程在这个 UDP 端口上真的在收包（07）。自家已连接的 01 不算，和 v1.2.0 一样
+func udpListening(port int) bool {
+	inodes := sockInodes(port, true, "07")
+	return len(inodes) > 0 && inodeOwner(inodes, true) == "ours"
+}
 
 func sockOwner(port int, udp bool) string {
 	inodes := sockInodes(port, udp)
@@ -330,16 +345,23 @@ func sockOwner(port int, udp bool) string {
 		}
 		return ""
 	}
+	return inodeOwner(inodes, udp)
+}
+
+// 找出持有这些套接字的进程。TCP 和 v1.2.0 一样认第一个匹配的进程；
+// UDP（preferOurs）同一端口可能还挂着别的进程的已连接套接字，只要有一个是自家的就算 ours，别让排在前面的外部进程盖过去
+func inodeOwner(inodes []string, preferOurs bool) string {
 	want := map[string]bool{}
 	for _, i := range inodes {
 		want["socket:["+i+"]"] = true
 	}
-	procs, _ := os.ReadDir("/proc")
+	other := ""
+	procs, _ := os.ReadDir(procDir)
 	for _, p := range procs {
 		if !p.IsDir() || p.Name()[0] < '0' || p.Name()[0] > '9' {
 			continue
 		}
-		dir := "/proc/" + p.Name()
+		dir := procDir + "/" + p.Name()
 		fds, err := os.ReadDir(dir + "/fd")
 		if err != nil {
 			continue
@@ -354,11 +376,20 @@ func sockOwner(port int, udp bool) string {
 			if strings.Contains(c, sbConf) || strings.Contains(c, xrayConf) || strings.HasSuffix(c, "dun serve") {
 				return "ours"
 			}
+			name := "未知进程"
 			if comm, _ := os.ReadFile(dir + "/comm"); len(strings.TrimSpace(string(comm))) > 0 {
-				return strings.TrimSpace(string(comm))
+				name = strings.TrimSpace(string(comm))
 			}
-			return "未知进程"
+			if !preferOurs {
+				return name
+			}
+			if other == "" {
+				other = name
+			}
 		}
+	}
+	if other != "" {
+		return other
 	}
 	return "未知进程"
 }
@@ -416,6 +447,8 @@ func curPorts(st *State, key string) (int, int) {
 		return st.WS.Port, st.WS.PubPort
 	case key == "hy2" && st.Hy2 != nil:
 		return st.Hy2.Port, st.Hy2.PubPort
+	case key == "tuic" && st.TUIC != nil:
+		return st.TUIC.Port, st.TUIC.PubPort
 	}
 	return 0, 0
 }
@@ -426,11 +459,11 @@ func askPort(st *State, prompt string, def int, key string) int {
 	for {
 		p := askInt(prompt, def, 1, 65535)
 		if _, u := used[p]; u {
-			warn("%d 已经分给本脚本的其他协议了", p)
+			reask("%d 已经分给本脚本的其他协议了", p)
 			continue
 		}
 		if o := portOwner(p); o != "" && o != "ours" && p != current {
-			warn("%d 被 %s 占用，换一个", p, o)
+			reask("%d 被 %s 占用，换一个", p, o)
 			continue
 		}
 		return p
@@ -453,7 +486,7 @@ func hasLocalIP(ip string, addrs []net.Addr) bool {
 }
 
 func (st *State) hasMappedPorts() bool {
-	for _, key := range []string{"reality", "anytls", "ws", "hy2"} {
+	for _, key := range []string{"reality", "anytls", "ws", "hy2", "tuic"} {
 		port, pub := curPorts(st, key)
 		if pub > 0 && pub != port {
 			return true

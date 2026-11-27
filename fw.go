@@ -352,10 +352,15 @@ func (st *State) fwInUse(ps, proto string) bool {
 				used = append(used, strconv.Itoa(p))
 			}
 		}
-	} else if h := st.Hy2; h != nil {
-		used = append(used, strconv.Itoa(h.Port))
-		if h.HopStart > 0 {
-			used = append(used, fmt.Sprintf("%d:%d", h.HopStart, h.HopEnd))
+	} else {
+		if h := st.Hy2; h != nil {
+			used = append(used, strconv.Itoa(h.Port))
+			if h.HopStart > 0 {
+				used = append(used, fmt.Sprintf("%d:%d", h.HopStart, h.HopEnd))
+			}
+		}
+		if st.TUIC != nil {
+			used = append(used, strconv.Itoa(st.TUIC.Port))
 		}
 	}
 	return slices.Contains(used, ps)

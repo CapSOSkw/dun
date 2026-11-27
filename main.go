@@ -18,10 +18,10 @@ import (
 var version = "dev"
 
 func usage() {
-	fmt.Printf(`dun %s：Reality 偷自己 / AnyTLS / CF WS / Argo 隧道 一键节点
+	fmt.Printf(`dun %s：Reality 偷自己 / AnyTLS / CF WS / Hysteria2 / TUIC v5 / Argo 隧道 一键节点
   dun                          打开管理菜单
-  dun install <reality|anytls|ws|all|hy2|argo>
-  dun remove  <reality|anytls|ws|hy2|argo>
+  dun install <reality|anytls|ws|all|hy2|tuic|argo>
+  dun remove  <reality|anytls|ws|hy2|tuic|argo>
   dun links                    查看订阅和链接
   dun mihomo                   输出 mihomo / Clash 配置
   dun cfip                     立即刷新优选 IP
@@ -230,6 +230,8 @@ func main() {
 			installWS(st)
 		case "hy2":
 			installHy2(st)
+		case "tuic":
+			installTUIC(st)
 		case "argo":
 			installArgo(st)
 		case "all":
@@ -251,6 +253,8 @@ func main() {
 			removeWS(st)
 		case "hy2":
 			removeHy2(st)
+		case "tuic":
+			removeTUIC(st)
 		case "argo":
 			removeArgo(st)
 		default:
@@ -285,8 +289,8 @@ func main() {
 		if err := issueCert(st, cfLogin()); err != nil {
 			die("续期失败：%v", err)
 		}
-		if st.AnyTLS != nil {
-			svcDo("restart", svcBox)
+		for _, s := range renewRestarts(st) {
+			svcDo("restart", s)
 		}
 		exp, _ := certExpiry()
 		ok("证书已更新，到期时间 %s", exp.Local().Format("2006-01-02"))

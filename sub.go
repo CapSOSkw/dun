@@ -303,6 +303,17 @@ func linkHy2(st *State, name string) string {
 	return fmt.Sprintf("hysteria2://%s@%s/?%s#%s", h.Password, hostPort(st.TLS.Host, h.PubPort), v.Encode(), frag(name))
 }
 
+// tuic://uuid:password@host:port?...，uuid 和密码按 userinfo 转义
+func linkTUIC(st *State, name string) string {
+	t := st.TUIC
+	v := url.Values{}
+	v.Set("congestion_control", t.cc())
+	v.Set("alpn", "h3")
+	v.Set("sni", st.TLS.Host)
+	v.Set("udp_relay_mode", "native")
+	return fmt.Sprintf("tuic://%s@%s?%s#%s", url.UserPassword(t.UUID, t.Password), hostPort(st.TLS.Host, t.PubPort), v.Encode(), frag(name))
+}
+
 func linkWS(st *State, a CFAddr) string {
 	w := st.WS
 	return fmt.Sprintf("vless://%s@%s?encryption=none&security=tls&sni=%s&fp=chrome&type=ws&host=%s&path=%s#%s",
@@ -428,6 +439,21 @@ func buildNodes(st *State) []node {
     sni: %s
     alpn: [h3]
 `, q(n), st.TLS.Host, h.PubPort, extra, q(h.Password), st.TLS.Host)})
+	}
+	if t := st.TUIC; t != nil {
+		n := base + "-TUIC"
+		ns = append(ns, node{n, linkTUIC(st, n), fmt.Sprintf(`  - name: %s
+    type: tuic
+    server: %s
+    port: %d
+    uuid: %s
+    password: %s
+    alpn: [h3]
+    sni: %s
+    congestion-controller: %s
+    udp-relay-mode: native
+    reduce-rtt: false
+`, q(n), q(st.TLS.Host), t.PubPort, q(t.UUID), q(t.Password), q(st.TLS.Host), t.cc())})
 	}
 	if st.Argo != nil {
 		ns = append(ns, argoNodes(st, base)...)
