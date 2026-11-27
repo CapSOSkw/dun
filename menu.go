@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	mrand "math/rand/v2"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -99,9 +100,11 @@ func showLinks(st *State) {
 	}
 	if st.Hy2 != nil {
 		l := linkHy2(st, base+"-Hy2")
-		b.WriteString("【Hysteria2】UDP，gecko 混淆 + 端口跳跃，线路差的机器用\n" + l + "\n")
 		if st.Hy2.HopStart > 0 {
+			b.WriteString("【Hysteria2】UDP，gecko 混淆 + 端口跳跃，线路差的机器用\n" + l + "\n")
 			b.WriteString(fmt.Sprintf("端口跳跃 %d-%d，订阅里已经带上\n", st.Hy2.HopStart, st.Hy2.HopEnd))
+		} else {
+			b.WriteString("【Hysteria2】UDP，gecko 混淆，单端口，线路差的机器用\n" + l + "\n")
 		}
 		b.WriteString("要 mihomo 1.19.34、sing-box 1.14 以上的客户端，老版本不认 gecko\n")
 		b.WriteString("\n")
@@ -120,8 +123,8 @@ func showLinks(st *State) {
 		}
 	}
 	info("链接也存在 %s", linksPath)
-	if st.NAT {
-		info("NAT 机器：链接里的端口用的是你填的外网端口")
+	if st.PortMode == portMapped {
+		info("链接里用的是你填的外网端口")
 	}
 	info("甲骨文、谷歌云、AWS 这类机器，记得在云后台的安全组也放行端口")
 }
@@ -146,19 +149,31 @@ func changePort(st *State) {
 		warn("Argo 隧道不占公网端口，没有要改的")
 		return
 	}
+	oldPort, oldPub := curPorts(st, k)
 	var port int
 	if k == "hy2" {
-		port = askUDPPort(st, curPort(st, k))
+		port = askUDPPort(st, oldPort)
 	} else {
-		port = askPort(st, protoLabel(k)+" 新端口", curPort(st, k), k)
+		port = askPort(st, protoLabel(k)+" 新端口", oldPort, k)
 	}
-	pub := askPubPort(st, port)
+	addrs, _ := net.InterfaceAddrs()
+	st.setPortMode(selectPortMode(st, addrs))
+	pub := port
+	if st.PortMode == portMapped && port == oldPort && oldPub > 0 {
+		pub = oldPub
+	}
+	pub = askPubPort(st, pub)
 	switch k {
 	case "hy2":
 		st.Hy2.Port, st.Hy2.PubPort = port, pub
 		fwOpenProto(fmt.Sprint(port), "udp")
+		setHy2Range(st.Hy2, st.PortMode)
+		if st.Hy2.HopStart > 0 {
+			fwOpenProto(fmt.Sprintf("%d:%d", st.Hy2.HopStart, st.Hy2.HopEnd), "udp")
+			info("云安全组请放行 UDP %d 和 %d-%d", pub, st.Hy2.HopStart, st.Hy2.HopEnd)
+		}
 		applyAll(st)
-		ok("端口已改成 UDP %d，端口跳跃也转到新端口了", port)
+		ok("Hy2 监听 UDP %d，外网端口 %d", port, pub)
 		return
 
 	case "reality":
@@ -544,6 +559,7 @@ func uninstallAll(st *State) {
 	if initSys == "systemd" {
 		run("systemctl", "daemon-reload")
 	}
+	fwCleanup()
 	os.RemoveAll(baseDir)
 	os.Remove(selfPath)
 	ok("已全部卸载，BBR 设置保留")

@@ -8,10 +8,7 @@ import (
 
 const (
 	baseDir     = "/etc/dun"
-	statePath   = baseDir + "/state.json"
 	cfPath      = baseDir + "/cf.json"
-	sbBin       = baseDir + "/bin/sing-box"
-	sbConf      = baseDir + "/sing-box.json"
 	certDir     = baseDir + "/cert"
 	certFile    = certDir + "/fullchain.pem"
 	keyFile     = certDir + "/key.pem"
@@ -30,6 +27,13 @@ const (
 	svcXray     = "dun-xray"
 	svcArgo     = "dun-argo"
 	argoPrefix  = "dun argo "
+)
+
+// 测试里指到临时目录
+var (
+	statePath = baseDir + "/state.json"
+	sbBin     = baseDir + "/bin/sing-box"
+	sbConf    = baseDir + "/sing-box.json"
 )
 
 // dun upgrade 从这个仓库的 Release 拉新版本；发版时 workflow 会用 -X main.repo 注入当前仓库
@@ -143,7 +147,7 @@ func (o CFIPOpt) fetches() bool { return o.Wetest || o.Domains }
 type State struct {
 	IP4      string   `json:"ip4,omitempty"`
 	IP6      string   `json:"ip6,omitempty"`
-	NAT      bool     `json:"nat,omitempty"`
+	PortMode string   `json:"port_mode,omitempty"` // direct 或 mapped，旧版 nat 只反映地址是否一致
 	Zone     *Zone    `json:"zone,omitempty"`
 	TLS      *TLSHost `json:"tls,omitempty"`
 	Reality  *Reality `json:"reality,omitempty"`
@@ -181,12 +185,28 @@ func (s *State) installed() bool {
 func (s *State) needTLS() bool { return s.Reality != nil || s.AnyTLS != nil || s.Hy2 != nil }
 
 func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, mode); err != nil {
+	// 同目录独占的临时文件，rename 才是原子的，同时写也不会互相覆盖临时文件
+	f, err := os.CreateTemp(dir, filepath.Base(path)+".tmp*")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	tmp := f.Name()
+	_, err = f.Write(data)
+	if err == nil {
+		err = f.Chmod(mode)
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Rename(tmp, path)
+	}
+	if err != nil {
+		os.Remove(tmp)
+	}
+	return err
 }

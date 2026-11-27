@@ -476,6 +476,41 @@ func newHy2(port, pub int) *Hy2 {
 	return h
 }
 
+func setHy2Range(h *Hy2, mode string) {
+	switch {
+	case mode == portMapped:
+		h.HopStart, h.HopEnd = 0, 0
+		info("使用服务商分配的 UDP 端口，Hy2 走单端口")
+	case !hopUsable(): // 已有范围也要探测：换到不让加 nat 规则的环境后别再发跳不过去的范围
+		h.HopStart, h.HopEnd = 0, 0
+		warn("这台机器加不了 iptables 的端口转发规则，Hy2 走单端口")
+	case h.HopStart == 0:
+		h.HopStart, h.HopEnd = freeUDPRange(r2(2000, 6000))
+	}
+}
+
+// 端口跳跃靠 iptables 的 nat 规则把一段 UDP 转到 Hy2 端口。没有 iptables 就先装；
+// 装不上，或者容器不让加 nat 规则，就别分配跳跃范围，免得订阅里带着跳不过去的端口
+var hopUsable = func() bool {
+	if !have("iptables") {
+		info("端口跳跃要用 iptables，先装上")
+		pkgInstall("iptables")
+	}
+	if !have("iptables") {
+		return false
+	}
+	probe := []string{"-t", "nat", "-A", "PREROUTING", "-p", "udp", "--dport", "1", "-m", "comment", "--comment", hopTag + "-probe", "-j", "REDIRECT", "--to-ports", "2"}
+	if run("iptables", probe...) != nil {
+		return false
+	}
+	probe[2] = "-D"
+	if run("iptables", probe...) != nil {
+		warn("端口跳跃的探测规则没删掉，请自己删：iptables %s", strings.Join(probe, " "))
+		return false
+	}
+	return true
+}
+
 func installHy2(st *State) {
 	if st.Hy2 != nil {
 		warn("Hysteria2 已经装过了，改端口、换密码走管理菜单")
@@ -486,11 +521,7 @@ func installHy2(st *State) {
 	port := askUDPPort(st, randUDPPort())
 	pub := askPubPort(st, port)
 	h := newHy2(port, pub)
-	if st.NAT {
-		info("NAT 机器开不了端口跳跃，用单端口")
-	} else if a, b := freeUDPRange(r2(2000, 6000)); a > 0 {
-		h.HopStart, h.HopEnd = a, b
-	}
+	setHy2Range(h, st.PortMode)
 	tlsHostEnsure(st)
 	st.Hy2 = h
 	fwOpenProto(fmt.Sprint(port), "udp")

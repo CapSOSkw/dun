@@ -188,6 +188,7 @@ func applyAll(st *State) {
 		svcDisable(svcWeb)
 	}
 	if !st.installed() {
+		fwPrune(st)
 		info("没有协议了，服务已停")
 		return
 	}
@@ -216,6 +217,7 @@ func applyAll(st *State) {
 			bad = st.Hy2.Port
 		}
 		if bad == 0 {
+			fwPrune(st)
 			ok("服务已运行")
 			return
 		}
@@ -233,13 +235,13 @@ const hopTag = "dun-hy2"
 
 func hopClear() {
 	for _, bin := range []string{"iptables", "ip6tables"} {
-		if !have(bin) {
+		if !fwHave(bin) {
 			continue
 		}
-		out, _ := runOut(bin, "-t", "nat", "-S", "PREROUTING")
+		out, _ := fwOut(bin, "-t", "nat", "-S", "PREROUTING")
 		for _, l := range strings.Split(out, "\n") {
 			if strings.HasPrefix(l, "-A ") && strings.Contains(l, hopTag) {
-				run(bin, append([]string{"-t", "nat", "-D"}, strings.Fields(l)[1:]...)...)
+				fwCmd(bin, append([]string{"-t", "nat", "-D"}, strings.Fields(l)[1:]...)...)
 			}
 		}
 	}
@@ -252,14 +254,27 @@ func hopApply(st *State) {
 		return
 	}
 	rng := fmt.Sprintf("%d:%d", h.HopStart, h.HopEnd)
+	// 纯 IPv6 的机器得 ip6tables 加上才算数
+	need := map[string]bool{"iptables": st.IP4 != "" || st.IP6 == "", "ip6tables": st.IP6 != ""}
 	added := false
 	for _, bin := range []string{"iptables", "ip6tables"} {
-		if have(bin) && run(bin, "-t", "nat", "-A", "PREROUTING", "-p", "udp", "--dport", rng,
-			"-m", "comment", "--comment", hopTag, "-j", "REDIRECT", "--to-ports", fmt.Sprint(h.Port)) == nil {
+		if fwHave(bin) && fwCmd(bin, "-t", "nat", "-A", "PREROUTING", "-p", "udp", "--dport", rng,
+			"-m", "comment", "--comment", hopTag, "-j", "REDIRECT", "--to-ports", fmt.Sprint(h.Port)) == nil && need[bin] {
 			added = true
 		}
 	}
 	if !added {
-		warn("端口跳跃规则加不上，只能用单端口 %d", h.Port)
+		start, end := h.HopStart, h.HopEnd
+		h.HopStart, h.HopEnd = 0, 0
+		// 写回状态，所有进程（订阅、dun links、dun mihomo）都不再发跳不过去的范围。
+		// 基于磁盘上最新的状态只改这两个字段，别拿启动时的旧快照整份覆盖别的进程刚存的设置
+		cur := loadState()
+		if cur.Hy2 == nil || cur.Hy2.HopStart != start || cur.Hy2.HopEnd != end {
+			warn("端口跳跃规则加不上，状态文件里的跳跃配置已经改过了，没有写回")
+			return
+		}
+		cur.Hy2.HopStart, cur.Hy2.HopEnd = 0, 0
+		cur.save()
+		warn("端口跳跃规则加不上，已关掉跳跃，Hy2 走单端口 %d；以后能加了，进菜单 11 改 Hy2 端口时会重新开", h.Port)
 	}
 }

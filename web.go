@@ -188,6 +188,9 @@ func serveSub(w http.ResponseWriter, clash bool) {
 func serve() {
 	detectOS()
 	st := loadState()
+	if st.Hy2 != nil {
+		hopApply(st) // 重启机器后 nat 表是空的，这里补上；加不上会改状态，所以排在开订阅监听之前
+	}
 	errs := make(chan error, 4)
 	if st.Reality != nil && st.TLS != nil {
 		ch := &certHolder{}
@@ -216,9 +219,6 @@ func serve() {
 			}
 		}
 	}
-	if st.Hy2 != nil {
-		hopApply(st) // 重启机器后 nat 表是空的，这里补上
-	}
 	if st.WS != nil {
 		srv := &http.Server{Handler: siteHandler(st, true), ReadHeaderTimeout: 15 * time.Second, ErrorLog: quietLog}
 		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", st.WS.Port))
@@ -239,6 +239,10 @@ func serve() {
 		go wetestLoop()
 	}
 	go renewLoop()
+	if initSys == "openrc" {
+		trimLogs() // 先截再打启动日志，这一行不会被截掉
+		go logTrimLoop()
+	}
 	log.Printf("dun %s 已启动", version)
 	if st.Reality == nil && st.WS == nil && st.Argo == nil {
 		select {}
