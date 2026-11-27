@@ -264,9 +264,17 @@ func hopApply(st *State) {
 		}
 	}
 	if !added {
-		// 写回状态，所有进程（订阅、dun links、dun mihomo）都不再发跳不过去的范围
+		start, end := h.HopStart, h.HopEnd
 		h.HopStart, h.HopEnd = 0, 0
-		st.save()
+		// 写回状态，所有进程（订阅、dun links、dun mihomo）都不再发跳不过去的范围。
+		// 基于磁盘上最新的状态只改这两个字段，别拿启动时的旧快照整份覆盖别的进程刚存的设置
+		cur := loadState()
+		if cur.Hy2 == nil || cur.Hy2.HopStart != start || cur.Hy2.HopEnd != end {
+			warn("端口跳跃规则加不上，状态文件里的跳跃配置已经改过了，没有写回")
+			return
+		}
+		cur.Hy2.HopStart, cur.Hy2.HopEnd = 0, 0
+		cur.save()
 		warn("端口跳跃规则加不上，已关掉跳跃，Hy2 走单端口 %d；以后能加了，进菜单 11 改 Hy2 端口时会重新开", h.Port)
 	}
 }

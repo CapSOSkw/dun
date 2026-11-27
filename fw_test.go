@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io"
 	"os"
 	"strings"
 	"testing"
@@ -225,5 +226,31 @@ func TestFwPrune(t *testing.T) {
 	b, _ := os.ReadFile(p)
 	if strings.Contains(string(b), "8443") || !strings.Contains(string(b), r443) || !strings.Contains(string(b), hop) {
 		t.Fatalf("开机文件删得不对：\n%s", b)
+	}
+}
+
+func captureStderr(f func()) string {
+	r, w, _ := os.Pipe()
+	old := os.Stderr
+	os.Stderr = w
+	f()
+	w.Close()
+	os.Stderr = old
+	b, _ := io.ReadAll(r)
+	return string(b)
+}
+
+// 实时规则读不到（-S 失败）：要提示，开机文件里的陈旧规则照样清
+func TestFwPruneLiveReadFailure(t *testing.T) {
+	stale := "-A INPUT -p tcp -m tcp --dport 8443 -m comment --comment dun-allow -j ACCEPT"
+	fakeFw(t, "", func([]string) bool { return false })
+	fwOut = func(string, ...string) (string, error) { return "", os.ErrPermission }
+	p := fakeRulesFile(t, stale)
+	out := captureStderr(func() { fwPrune(&State{Reality: &Reality{Port: 443}}) })
+	if b, _ := os.ReadFile(p); strings.Contains(string(b), "8443") {
+		t.Fatalf("开机文件里的陈旧规则没删：\n%s", b)
+	}
+	if !strings.Contains(out, "读不到") {
+		t.Fatalf("实时规则读不到却没提示：%q", out)
 	}
 }

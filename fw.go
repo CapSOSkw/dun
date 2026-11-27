@@ -339,12 +339,7 @@ func fwPrune(st *State) {
 		return ps != "" && !st.fwInUse(ps, proto)
 	}
 	for _, fam := range fwFamilies {
-		// 这一族的 iptables 用不了（比如容器里没有 IPv6）就不管，免得每次应用都报错
-		if fwHave(fam.bin) {
-			if _, err := fwOut(fam.bin, "-S", "INPUT"); err == nil {
-				fwRemove(fam, stale)
-			}
-		}
+		fwRemove(fam, stale) // 实时规则读不到时 fwRemove 会提示，开机文件照样清
 	}
 }
 

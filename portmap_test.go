@@ -189,3 +189,48 @@ func TestHopApplyFailPersists(t *testing.T) {
 		t.Fatal("跳跃规则没加上，磁盘上的状态还带着范围")
 	}
 }
+
+// 启动回落期间别的进程刚存了设置（比如改了优选 IP）：回落只清跳跃两个字段，那次更新要留着
+func TestHopApplyFailKeepsNewerState(t *testing.T) {
+	os_ := statePath
+	t.Cleanup(func() { statePath = os_ })
+	statePath = t.TempDir() + "/state.json"
+	st := &State{IP4: "203.0.113.5", TLS: &TLSHost{Host: "a.example.com"},
+		Hy2: &Hy2{Port: 5443, PubPort: 5443, HopStart: 20000, HopEnd: 21000, HopSec: 30}}
+	st.save()
+	fakeFw(t, "", func(a []string) bool {
+		if len(a) > 2 && a[1] == "nat" && a[2] == "-A" {
+			other := loadState() // 加规则的同时，另一个进程改了设置
+			other.CFIP.NoTokyo = true
+			other.save()
+			return true
+		}
+		return false
+	})
+	hopApply(st)
+	fresh := loadState()
+	if !fresh.CFIP.NoTokyo {
+		t.Fatal("回落用旧快照覆盖了别的进程刚存的设置")
+	}
+	if fresh.Hy2.HopStart != 0 || fresh.Hy2.HopEnd != 0 || st.Hy2.HopStart != 0 {
+		t.Fatal("回落没清掉跳跃范围")
+	}
+}
+
+// 磁盘上的跳跃范围已经被别的进程改了：不覆盖
+func TestHopApplyFailSkipsChangedRange(t *testing.T) {
+	os_ := statePath
+	t.Cleanup(func() { statePath = os_ })
+	statePath = t.TempDir() + "/state.json"
+	st := &State{IP4: "203.0.113.5", TLS: &TLSHost{Host: "a.example.com"},
+		Hy2: &Hy2{Port: 5443, PubPort: 5443, HopStart: 20000, HopEnd: 21000, HopSec: 30}}
+	st.save()
+	disk := loadState()
+	disk.Hy2.HopStart, disk.Hy2.HopEnd = 30000, 31000
+	disk.save()
+	fakeFw(t, "", func(a []string) bool { return len(a) > 2 && a[1] == "nat" && a[2] == "-A" })
+	hopApply(st)
+	if fresh := loadState(); fresh.Hy2.HopStart != 30000 || fresh.Hy2.HopEnd != 31000 {
+		t.Fatalf("磁盘上新的跳跃范围被覆盖了：%d-%d", fresh.Hy2.HopStart, fresh.Hy2.HopEnd)
+	}
+}
