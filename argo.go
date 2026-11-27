@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -48,6 +49,18 @@ func xrayVersion() string             { return xrayVersionAt(xrayBin) }
 func cfdVersionAt(bin string) string { return binVersion(bin, 2, "--version") }
 func cfdVersion() string             { return cfdVersionAt(cfdBin) }
 
+// 重启服务，等一会儿看还在不在跑
+func restartCheck(svc string, wait time.Duration) error {
+	if err := svcDo("restart", svc); err != nil {
+		return err
+	}
+	sleep(wait)
+	if !svcActive(svc) {
+		return fmt.Errorf("%s 重启后没在运行", svc)
+	}
+	return nil
+}
+
 // 新文件先放在 .new，自己能跑才换上去，跑不起来就删掉，原来的不动；
 // 换上去以后跑不起来就换回旧的。旧的留成 .old，更新后服务起不来时回退用
 func placeBin(bin, name string, ver func(string) string) {
@@ -78,11 +91,36 @@ func placeBin(bin, name string, ver func(string) string) {
 	}
 }
 
-// 更新后服务起不来时换回 .old
-func restoreOld(bin string) {
-	if err := os.Rename(bin+".old", bin); err != nil {
-		warn("换回旧版本失败，手动把 %s.old 改回 %s: %v", bin, bin, err)
+// 更新前删掉上次留下的 .old，返回原来有没有装。原来没有时回退不能拿别的 .old 顶上
+func prepOld(bin string) bool {
+	if err := os.Remove(bin + ".old"); err != nil && !os.IsNotExist(err) {
+		die("删不掉上次留下的 %s.old，没更新: %v", bin, err)
 	}
+	return exists(bin)
+}
+
+// 测试里换掉，不真等
+var sleep = time.Sleep
+
+// 更新后服务起不来：换回 .old 再重启。原来没有装、或者换不回去时不重启，免得再起一次坏的
+func rollbackBin(bin, svc string, had bool) {
+	if !had {
+		warn("原来没有装 %s，没有旧版本可回退", bin)
+		return
+	}
+	if err := os.Rename(bin+".old", bin); err != nil {
+		restart := "systemctl restart " + svc
+		if initSys != "systemd" {
+			restart = "rc-service " + svc + " restart"
+		}
+		warn("换回旧版本失败: %v。%s 没有重启，手动恢复：mv %s.old %s && %s", err, svc, bin, bin, restart)
+		return
+	}
+	if err := svcDo("restart", svc); err != nil {
+		warn("已换回旧版本，但 %s 重启失败: %v，看看日志", svc, err)
+		return
+	}
+	ok("已换回旧版本")
 }
 
 func unzipOne(zf, name, dst string) error {
@@ -197,40 +235,41 @@ func svcExists(name string) bool {
 }
 
 // 由 applyAll 调用，Xray 配置已经检查过、换好了。配置没变就不重启，免得 Argo 节点断线；
-// cloudflared 的路由在 CF 上，平时也不用重启它
+// cloudflared 的路由在 CF 上，平时也不用重启它。一步出错也接着做完，错误汇总返回
 func xrayApply(st *State, changed bool) error {
+	var errs []error
+	add := func(err error, what string) {
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %v", what, err))
+		}
+	}
 	if st.Argo == nil {
 		for _, s := range []string{svcArgo, svcXray} {
 			if svcExists(s) {
-				svcDisable(s)
+				add(svcDisable(s), s+" 停不掉")
 			}
 		}
-		return nil
+		return errors.Join(errs...)
 	}
-	var err error
-	if changed {
-		svcEnable(svcXray)
-		err = svcDo("restart", svcXray)
-	} else if !svcActive(svcXray) {
-		svcEnable(svcXray)
-		err = svcDo("start", svcXray)
-	}
-	if err != nil {
-		return fmt.Errorf("Xray 服务起不来: %v", err)
+	if changed || !svcActive(svcXray) {
+		add(svcEnable(svcXray), "Xray 设不了开机启动")
+		action := "start"
+		if changed {
+			action = "restart"
+		}
+		add(svcDo(action, svcXray), "Xray 服务起不来")
 	}
 	if st.Argo.External { // 复用的隧道由这台机器上别的 cloudflared 在跑，dun 不再起一个
 		if svcExists(svcArgo) && svcActive(svcArgo) {
-			svcDisable(svcArgo)
+			add(svcDisable(svcArgo), "dun-argo 停不掉")
 		}
-		return nil
+		return errors.Join(errs...)
 	}
-	svcEnable(svcArgo)
+	add(svcEnable(svcArgo), "cloudflared 设不了开机启动")
 	if !svcActive(svcArgo) {
-		if err := svcDo("start", svcArgo); err != nil {
-			return fmt.Errorf("cloudflared 服务起不来: %v", err)
-		}
+		add(svcDo("start", svcArgo), "cloudflared 服务起不来")
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // ── 隧道 ─────────────────────────────────────────────
@@ -780,7 +819,9 @@ func installArgo(st *State) {
 			die("保存隧道 token 失败: %v", err)
 		}
 	}
-	// 下面开始动 CF 上的路由和解析。先把状态（含原有解析的备份）存下来，中途断了也能用「卸载 Argo」收拾干净
+	// 下面开始动 CF 上的路由和解析。先把状态（含原有解析的备份）存下来，中途断了也能用「卸载 Argo」收拾干净。
+	// 这里和下面那次保存都在 applyAll 的预检之前，是故意的：预检不过时 state.json 里留着 Argo，
+	// 才能在菜单里卸载 Argo，清掉 CF 上已经建好的隧道和解析
 	ensureToken(st)
 	st.Argo = a
 	st.save()
@@ -799,7 +840,7 @@ func installArgo(st *State) {
 	} else {
 		argoDashboardRoute(st, c, a)
 	}
-	st.save()
+	st.save() // 记下解析的记录 ID，原因见上
 	argoRules(st, c)
 	applyAll(st)
 	argoWait(st, c)
@@ -828,7 +869,11 @@ func removeArgo(st *State) {
 		!confirm("没有能用的 CF 账号，CF 上的解析、隧道和规则删不掉，得自己去后台删。还是继续卸载？", false) {
 		return
 	}
-	// 先停隧道（隧道上还挂着连接就删不掉），CF 上清理完再改状态，中途断了还能重来
+	// 卸掉 Argo 后的新配置先检查，不过就退出，服务和 CF 上都还没动
+	next := *st
+	next.Argo = nil
+	applyCheck(&next)
+	// 再停隧道（隧道上还挂着连接就删不掉），CF 上清理完再改状态，中途断了还能重来
 	for _, s := range []string{svcArgo, svcXray} {
 		svcDisable(s)
 	}
@@ -966,16 +1011,15 @@ func updateXray() {
 	if ver == "" {
 		return
 	}
+	had := prepOld(xrayBin)
 	xrayInstall(ver)
 	out, err := runOut(xrayBin, "run", "-test", "-c", xrayConf)
 	if err == nil {
-		svcDo("restart", svcXray)
-		time.Sleep(2 * time.Second)
+		err = restartCheck(svcXray, 2*time.Second)
 	}
-	if err != nil || !svcActive(svcXray) {
-		warn("新版本 Xray 跑不起来，回退到 %s\n%s", cur, out)
-		restoreOld(xrayBin)
-		svcDo("restart", svcXray)
+	if err != nil {
+		warn("新版本 Xray 跑不起来，回退到 %s: %v\n%s", cur, err, out)
+		rollbackBin(xrayBin, svcXray, had)
 		return
 	}
 	os.Remove(xrayBin + ".old")
@@ -988,13 +1032,11 @@ func updateCfd() {
 	if ver == "" {
 		return
 	}
+	had := prepOld(cfdBin)
 	cfdInstall(ver)
-	svcDo("restart", svcArgo)
-	time.Sleep(3 * time.Second)
-	if !svcActive(svcArgo) {
-		warn("新版本 cloudflared 跑不起来，回退到 %s", cur)
-		restoreOld(cfdBin)
-		svcDo("restart", svcArgo)
+	if err := restartCheck(svcArgo, 3*time.Second); err != nil {
+		warn("新版本 cloudflared 跑不起来，回退到 %s: %v", cur, err)
+		rollbackBin(cfdBin, svcArgo, had)
 		return
 	}
 	os.Remove(cfdBin + ".old")

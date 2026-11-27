@@ -5,12 +5,16 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path"
+	"path/filepath"
 	"runtime"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -79,7 +83,8 @@ func vcmp(a, b string) int {
 	return 0
 }
 
-// 菜单 15：列出当前、推荐、上游最新正式版，问装哪个；返回 "" = 不更新
+// 菜单 15：列出当前、推荐、上游最新正式版，问装哪个；返回 "" = 不更新。
+// 回车、读到头都算不更新；比当前旧的版本写明「降级到」，还要再确认一次
 func pickVersion(name, cur, pinned, latest string) string {
 	show := cur
 	if show == "" {
@@ -91,36 +96,35 @@ func pickVersion(name, cur, pinned, latest string) string {
 			warn("%s 已经是推荐版本，先不更新", name)
 			return ""
 		}
-		if confirm(fmt.Sprintf("装推荐版本 %s？", pinned), vcmp(cur, pinned) < 0) {
-			return pinned
+	} else {
+		info("%s 当前 %s，推荐 %s，上游最新正式版 %s", name, show, pinned, latest)
+	}
+	var vers []string
+	add := func(v, what string) {
+		if v == "" || slices.Contains(vers, v) {
+			return
 		}
+		verb := "升到"
+		if c := vcmp(v, cur); c == 0 {
+			verb = "重装"
+		} else if c < 0 {
+			verb = "降级到"
+		}
+		vers = append(vers, v)
+		fmt.Fprintf(os.Stderr, "  %d. %s%s %s\n", len(vers), verb, what, v)
+	}
+	add(pinned, "推荐版本")
+	add(latest, "最新正式版")
+	n, err := strconv.Atoi(ask("装哪个（回车不更新）", "0"))
+	if err != nil || n < 1 || n > len(vers) {
+		info("不更新 %s", name)
 		return ""
 	}
-	info("%s 当前 %s，推荐 %s，上游最新正式版 %s", name, show, pinned, latest)
-	switch {
-	case vcmp(cur, pinned) < 0 && vcmp(latest, pinned) > 0:
-		switch choose([]string{"升到推荐版本 " + pinned, "升到最新正式版 " + latest, "不更新"}, 1) {
-		case 0:
-			return pinned
-		case 1:
-			return latest
-		}
-		return ""
-	case vcmp(cur, latest) >= 0:
-		if confirm(name+" 已经是最新 "+cur+"，还要重装？", false) {
-			return latest
-		}
-		return ""
-	case vcmp(cur, pinned) < 0:
-		if confirm(fmt.Sprintf("升到推荐版本 %s？", pinned), true) {
-			return pinned
-		}
+	v := vers[n-1]
+	if vcmp(v, cur) < 0 && !confirm(fmt.Sprintf("%s 会从 %s 降级到 %s，确定？", name, show, v), false) {
 		return ""
 	}
-	if confirm(fmt.Sprintf("升到最新正式版 %s？", latest), false) {
-		return latest
-	}
-	return ""
+	return v
 }
 
 func sbInstall(ver string) {
@@ -239,15 +243,29 @@ var (
 	portReady  = func(p int) bool { return portOwner(p) == "ours" }
 	udpReady   = udpListening
 	applyPrune = fwPrune
-	applyHop   = hopApply
+	applyHop   = hopRules
 	applyLog   = func() { svcLog(30, false) }
+	applyWrite = writeFileAtomic
 	readyWait  = 300 * time.Millisecond
 )
 
-// 新配置写到临时文件检查，检查完临时文件删掉
-func checkConf(tmp string, b []byte, bin string, args ...string) (string, error) {
-	defer os.Remove(tmp)
-	if err := os.WriteFile(tmp, b, 0600); err != nil {
+// 新配置写到同目录的独立临时文件里检查，用完删掉
+func checkConf(dir, pattern string, b []byte, bin string, args ...string) (string, error) {
+	f, err := os.CreateTemp(dir, pattern)
+	if err != nil {
+		return err.Error(), err
+	}
+	tmp := f.Name()
+	defer func() {
+		if err := os.Remove(tmp); err != nil {
+			warn("临时文件 %s 删不掉: %v", tmp, err)
+		}
+	}()
+	_, err = f.Write(b)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
 		return err.Error(), err
 	}
 	out, err := runOut(bin, append(args, tmp)...)
@@ -276,56 +294,66 @@ func snapFiles(paths ...string) []fileSnap {
 	return snap
 }
 
-// 分两步，不留半态：
-//  1. 新配置写到临时文件检查，不过就退出，磁盘上的状态、配置和正在跑的服务都不动
-//  2. 记下旧文件，换上新状态和新配置再起服务、等端口；中途失败就换回旧文件、按旧状态恢复服务再退出。
-//     旧的放行规则只在全部就绪后才回收
-func applyAll(st *State) {
+// 预检：新配置写临时文件检查，不过就退出，磁盘上的状态、配置和正在跑的服务都不动。
+// 没有入站时不跑 sing-box，不用检查；sbConf 照旧写一份空入站的配置（和以前一样），回滚时一起还原
+func applyCheck(st *State) (sbNew, xrNew []byte, xrChanged bool) {
 	cfg, n := sbConfig(st)
-	sbNew, _ := json.MarshalIndent(cfg, "", "  ")
-	stNew, _ := json.MarshalIndent(st, "", "  ")
-	var xrNew []byte
-	xrChanged := false
+	sbNew, _ = json.MarshalIndent(cfg, "", "  ")
 	if st.Argo != nil {
 		xrNew, _ = json.MarshalIndent(xrayConfig(st), "", "  ")
 		cur, _ := os.ReadFile(xrayConf)
 		xrChanged = !bytes.Equal(cur, xrNew)
 	}
 	if n > 0 {
-		if out, err := checkConf(sbConf+".check", sbNew, sbBin, "check", "-c"); err != nil {
+		if out, err := checkConf(filepath.Dir(sbConf), "sing-box-check-*.json", sbNew, sbBin, "check", "-c"); err != nil {
 			die("sing-box 配置检查不通过，旧配置没动:\n%s", out)
 		}
 	}
 	if xrChanged { // Xray 按扩展名认格式，临时文件得是 .json
-		if out, err := checkConf(strings.TrimSuffix(xrayConf, ".json")+".check.json", xrNew, xrayBin, "run", "-test", "-c"); err != nil {
+		if out, err := checkConf(filepath.Dir(xrayConf), "xray-check-*.json", xrNew, xrayBin, "run", "-test", "-c"); err != nil {
 			die("Xray 配置检查不通过，旧配置没动:\n%s", out)
 		}
 	}
+	return
+}
 
+// 分两步，不留半态：
+//  1. applyCheck 预检
+//  2. 记下旧文件，换上新状态和新配置再起服务、等端口；中途失败就换回旧文件、按旧状态恢复服务再退出。
+//     旧的放行规则只在全部就绪后才回收
+func applyAll(st *State) {
+	sbNew, xrNew, xrChanged := applyCheck(st)
+	stNew, _ := json.MarshalIndent(st, "", "  ")
 	old := snapFiles(statePath, sbConf, xrayConf)
-	fail := func(f string, a ...any) {
-		warn(f, a...)
-		applyRollback(old, xrChanged)
-		die("没应用成功，已换回原来的配置")
+	fail := func(err error) {
+		warn("%v", err)
+		if rerr := applyRollback(old, xrChanged); rerr != nil {
+			die("没应用成功，回滚未完全成功：\n%v", rerr)
+		}
+		die("没应用成功，已回滚到原来的配置")
 	}
 	// dun serve 启动时按 state.json 定监听端口，所以先换状态再重启服务
-	err := writeFileAtomic(statePath, stNew, 0600)
+	err := applyWrite(statePath, stNew, 0600)
 	if err == nil {
-		err = writeFileAtomic(sbConf, sbNew, 0600)
+		err = applyWrite(sbConf, sbNew, 0600)
 	}
 	if err == nil && xrChanged {
-		err = writeFileAtomic(xrayConf, xrNew, 0600)
+		err = applyWrite(xrayConf, xrNew, 0600)
 	}
 	if err != nil {
-		fail("写配置失败: %v", err)
+		fail(fmt.Errorf("写配置失败: %v", err))
 	}
-	if err := startServices(st, xrChanged); err != nil {
-		fail("%v", err)
-	}
-	if !st.installed() {
+	err = startServices(st, xrChanged, false)
+	if !st.installed() { // 没有协议了：和以前一样，停服务出错只提示
+		if err != nil {
+			warn("%v", err)
+		}
 		applyPrune(st)
 		info("没有协议了，服务已停")
 		return
+	}
+	if err != nil {
+		fail(err)
 	}
 	// 等端口起来再报成功
 	want := []int{}
@@ -348,79 +376,94 @@ func applyAll(st *State) {
 	if st.TUIC != nil {
 		udp = append(udp, st.TUIC.Port)
 	}
-	bad := 0
+	bad := ""
 	for i := 0; i < 20; i++ {
 		if i > 0 {
 			time.Sleep(readyWait)
 		}
-		bad = 0
+		bad = ""
 		for _, p := range want {
 			if !portReady(p) {
-				bad = p
+				bad = fmt.Sprintf("TCP 端口 %d", p)
 			}
 		}
 		for _, p := range udp {
 			if !udpReady(p) {
-				bad = p
+				bad = fmt.Sprintf("UDP 端口 %d", p)
 			}
 		}
-		if bad == 0 {
+		if st.Argo != nil && !st.Argo.External && !svcActive(svcArgo) {
+			bad = "cloudflared 服务 " + svcArgo
+		}
+		if bad == "" {
 			applyPrune(st)
 			ok("服务已运行")
 			return
 		}
 	}
 	applyLog()
-	fail("端口 %d 没起来，看上面的日志", bad)
+	fail(fmt.Errorf("%s 没起来，看上面的日志", bad))
 }
 
-// 按 st 起停所有服务；applyAll 和回滚共用
-func startServices(st *State, xrChanged bool) error {
-	if _, n := sbConfig(st); n == 0 {
-		svcDisable(svcBox)
-	} else {
-		svcEnable(svcBox)
-		if err := svcDo("restart", svcBox); err != nil {
-			return fmt.Errorf("sing-box 服务起不来: %v", err)
+// 按 st 起停所有服务；一步出错也接着做完，错误汇总返回。applyAll 和回滚共用。
+// 回滚时跳跃规则加不上只记错误，不改状态文件（刚还原的字节要保持原样）
+func startServices(st *State, xrChanged, rollback bool) error {
+	var errs []error
+	add := func(err error, what string) {
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %v", what, err))
 		}
 	}
-	applyHop(st)
+	if _, n := sbConfig(st); n == 0 {
+		add(svcDisable(svcBox), "sing-box 服务停不掉")
+	} else {
+		add(svcEnable(svcBox), "sing-box 设不了开机启动")
+		add(svcDo("restart", svcBox), "sing-box 服务起不来")
+	}
+	if err := applyHop(st); err != nil {
+		if rollback {
+			add(err, "按原来的配置加端口跳跃")
+		} else {
+			add(hopOff(st), "关掉端口跳跃")
+		}
+	}
 	if err := xrayApply(st, xrChanged); err != nil {
-		return err
+		errs = append(errs, err)
 	}
-	if !st.installed() {
-		svcDisable(svcWeb)
-		return nil
+	if st.installed() {
+		add(svcEnable(svcWeb), "dun 服务设不了开机启动")
+		add(svcDo("restart", svcWeb), "dun 服务起不来")
+	} else {
+		add(svcDisable(svcWeb), "dun 服务停不掉")
 	}
-	svcEnable(svcWeb)
-	if err := svcDo("restart", svcWeb); err != nil {
-		return fmt.Errorf("dun 服务起不来: %v", err)
-	}
-	return nil
+	return errors.Join(errs...)
 }
 
-// 换回 applyAll 之前的文件，按旧状态重新加跳跃规则、起停服务。不回收放行规则
-func applyRollback(old []fileSnap, xrChanged bool) {
+// 换回 applyAll 之前的文件，按旧状态重新加跳跃规则、起停服务；每一步都做，错误汇总返回。
+// 不回收放行规则，也不调用会 die 的 loadState / save
+func applyRollback(old []fileSnap, xrChanged bool) error {
+	var errs []error
 	prev := &State{}
 	for _, f := range old {
 		var err error
 		if f.had {
-			err = writeFileAtomic(f.path, f.data, 0600)
+			err = applyWrite(f.path, f.data, 0600)
 		} else if err = os.Remove(f.path); os.IsNotExist(err) {
 			err = nil
 		}
 		if err != nil {
-			warn("还原 %s 失败: %v", f.path, err)
+			errs = append(errs, fmt.Errorf("还原 %s: %v", f.path, err))
 		}
 		if f.path == statePath && f.had {
 			if err := json.Unmarshal(f.data, prev); err != nil {
-				warn("旧状态文件解析不了: %v", err)
+				errs = append(errs, fmt.Errorf("旧状态文件解析不了: %v", err))
 			}
 		}
 	}
-	if err := startServices(prev, xrChanged); err != nil {
-		warn("按原来的配置恢复服务也失败了: %v", err)
+	if err := startServices(prev, xrChanged, true); err != nil {
+		errs = append(errs, err)
 	}
+	return errors.Join(errs...)
 }
 
 // ── Hysteria2 端口跳跃 ───────────────────────────────
@@ -441,11 +484,21 @@ func hopClear() {
 	}
 }
 
+// 服务启动时用：规则加不上就关掉跳跃并写回状态
 func hopApply(st *State) {
+	if hopRules(st) != nil {
+		if err := hopOff(st); err != nil {
+			die("%v", err)
+		}
+	}
+}
+
+// 按 st 重加跳跃规则，加不上返回 error，不碰状态文件
+func hopRules(st *State) error {
 	hopClear()
 	h := st.Hy2
 	if h == nil || h.HopStart == 0 {
-		return
+		return nil
 	}
 	rng := fmt.Sprintf("%d:%d", h.HopStart, h.HopEnd)
 	// 纯 IPv6 的机器得 ip6tables 加上才算数
@@ -458,17 +511,29 @@ func hopApply(st *State) {
 		}
 	}
 	if !added {
-		start, end := h.HopStart, h.HopEnd
-		h.HopStart, h.HopEnd = 0, 0
-		// 写回状态，所有进程（订阅、dun links、dun mihomo）都不再发跳不过去的范围。
-		// 基于磁盘上最新的状态只改这两个字段，别拿启动时的旧快照整份覆盖别的进程刚存的设置
-		cur := loadState()
-		if cur.Hy2 == nil || cur.Hy2.HopStart != start || cur.Hy2.HopEnd != end {
-			warn("端口跳跃规则加不上，状态文件里的跳跃配置已经改过了，没有写回")
-			return
-		}
-		cur.Hy2.HopStart, cur.Hy2.HopEnd = 0, 0
-		cur.save()
-		warn("端口跳跃规则加不上，已关掉跳跃，Hy2 走单端口 %d；以后能加了，进菜单 11 改 Hy2 端口时会重新开", h.Port)
+		return fmt.Errorf("端口跳跃规则 %s 加不上", rng)
 	}
+	return nil
+}
+
+// 跳跃规则加不上：关掉跳跃写回状态，所有进程（订阅、dun links、dun mihomo）都不再发跳不过去的范围。
+// 基于磁盘上最新的状态只改这两个字段，别拿启动时的旧快照整份覆盖别的进程刚存的设置
+func hopOff(st *State) error {
+	h := st.Hy2
+	start, end := h.HopStart, h.HopEnd
+	h.HopStart, h.HopEnd = 0, 0
+	cur, err := readState()
+	if err != nil {
+		return err
+	}
+	if cur.Hy2 == nil || cur.Hy2.HopStart != start || cur.Hy2.HopEnd != end {
+		warn("端口跳跃规则加不上，状态文件里的跳跃配置已经改过了，没有写回")
+		return nil
+	}
+	cur.Hy2.HopStart, cur.Hy2.HopEnd = 0, 0
+	if err := cur.write(); err != nil {
+		return fmt.Errorf("保存状态失败: %v", err)
+	}
+	warn("端口跳跃规则加不上，已关掉跳跃，Hy2 走单端口 %d；以后能加了，进菜单 11 改 Hy2 端口时会重新开", h.Port)
+	return nil
 }

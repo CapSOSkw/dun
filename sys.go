@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand/v2"
@@ -186,21 +187,30 @@ func svcDo(action, name string) error {
 	return run("rc-service", name, action)
 }
 
-func svcEnable(name string) {
+// OpenRC 的开机项是 /etc/runlevels/default 下的链接。已经加过、本来就没加时 rc-update 也会报错，以链接为准
+func svcEnable(name string) error {
 	if initSys == "systemd" {
-		run("systemctl", "enable", name)
-	} else {
-		run("rc-update", "add", name, "default")
+		return run("systemctl", "enable", name)
 	}
+	if err := run("rc-update", "add", name, "default"); err != nil && !exists("/etc/runlevels/default/"+name) {
+		return err
+	}
+	return nil
 }
 
-func svcDisable(name string) {
+// 停掉并取消开机启动；本来就停着的不算失败
+func svcDisable(name string) error {
 	if initSys == "systemd" {
-		run("systemctl", "disable", "--now", name)
-	} else {
-		run("rc-service", name, "stop")
-		run("rc-update", "del", name, "default")
+		return run("systemctl", "disable", "--now", name)
 	}
+	var errs []error
+	if err := run("rc-service", name, "stop"); err != nil && svcActive(name) {
+		errs = append(errs, err)
+	}
+	if err := run("rc-update", "del", name, "default"); err != nil && exists("/etc/runlevels/default/"+name) {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 func svcActive(name string) bool {

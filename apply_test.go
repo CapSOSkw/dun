@@ -3,32 +3,39 @@ package main
 import (
 	"bufio"
 	"errors"
+	"fmt"
 	"os"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 // applyAll 的替身：外部命令只记下来，不真跑 systemctl、sing-box、xray、iptables
 type applyRec struct {
-	cmds   []string // run 跑过的命令（svcDo / svcEnable / svcDisable / svcActive）
-	hops   []int    // 每次 hopApply 时 Hy2 的跳跃起点
-	prunes int
-	ready  func(port int) bool
-	check  func(bin string) error // sing-box check / xray run -test 的结果
-	onCmd  func(cmd string)
+	cmds     []string               // run 跑过的命令（svcDo / svcEnable / svcDisable / svcActive）
+	hops     []int                  // 每次加跳跃规则时 Hy2 的跳跃起点
+	writes   map[string]int         // applyWrite 每个文件写了几次
+	prunes   int                    // fwPrune 调了几次
+	tcp, udp func(port int) bool    // 端口就绪
+	check    func(bin string) error // sing-box check / xray run -test 的结果
+	fail     func(cmd string, nth int) error
+	writeErr func(path string, nth int) error
+	hopErr   func(nth int) error
+	onCmd    func(cmd string)
 }
 
 func fakeApply(t *testing.T) *applyRec {
 	t.Helper()
-	r := &applyRec{ready: func(int) bool { return true }, check: func(string) error { return nil }}
+	r := &applyRec{writes: map[string]int{}, tcp: func(int) bool { return true }, udp: func(int) bool { return true },
+		check: func(string) error { return nil }}
 	ob, oc, ox, oxb, os_, oe, oi := sbBin, sbConf, xrayConf, xrayBin, statePath, dieExit, initSys
 	orun, oout := run, runOut
-	opr, oudp, oprune, ohop, olog, ow := portReady, udpReady, applyPrune, applyHop, applyLog, readyWait
+	opr, oudp, oprune, ohop, olog, owr, ow := portReady, udpReady, applyPrune, applyHop, applyLog, applyWrite, readyWait
 	t.Cleanup(func() {
 		sbBin, sbConf, xrayConf, xrayBin, statePath, dieExit, initSys = ob, oc, ox, oxb, os_, oe, oi
 		run, runOut = orun, oout
-		portReady, udpReady, applyPrune, applyHop, applyLog, readyWait = opr, oudp, oprune, ohop, olog, ow
+		portReady, udpReady, applyPrune, applyHop, applyLog, applyWrite, readyWait = opr, oudp, oprune, ohop, olog, owr, ow
 	})
 	dir := t.TempDir()
 	sbBin, sbConf, xrayConf, xrayBin, statePath = dir+"/sing-box", dir+"/sing-box.json", dir+"/xray.json", dir+"/xray", dir+"/state.json"
@@ -40,6 +47,9 @@ func fakeApply(t *testing.T) *applyRec {
 		if r.onCmd != nil {
 			r.onCmd(c)
 		}
+		if r.fail != nil {
+			return r.fail(c, r.has(c))
+		}
 		return nil
 	}
 	runOut = func(name string, args ...string) (string, error) {
@@ -48,15 +58,28 @@ func fakeApply(t *testing.T) *applyRec {
 		}
 		return "", nil
 	}
-	portReady = func(p int) bool { return r.ready(p) }
-	udpReady = func(p int) bool { return r.ready(p) }
+	portReady = func(p int) bool { return r.tcp(p) }
+	udpReady = func(p int) bool { return r.udp(p) }
 	applyPrune = func(*State) { r.prunes++ }
-	applyHop = func(st *State) {
+	applyHop = func(st *State) error {
 		h := 0
 		if st.Hy2 != nil {
 			h = st.Hy2.HopStart
 		}
 		r.hops = append(r.hops, h)
+		if r.hopErr != nil {
+			return r.hopErr(len(r.hops))
+		}
+		return nil
+	}
+	applyWrite = func(p string, b []byte, m os.FileMode) error {
+		r.writes[p]++
+		if r.writeErr != nil {
+			if err := r.writeErr(p, r.writes[p]); err != nil {
+				return err
+			}
+		}
+		return writeFileAtomic(p, b, m)
 	}
 	applyLog = func() {}
 	readyWait = 0
@@ -82,6 +105,7 @@ func runApply(st *State) (died bool, out string) {
 	return
 }
 
+// 旧状态：Reality + Hy2（带跳跃）+ dun 自己跑 cloudflared 的 Argo
 func oldApplyState() *State {
 	return &State{IP4: "203.0.113.5", TLS: &TLSHost{Host: "n.r4nd.example.com"},
 		Reality: &Reality{Port: 8443, PubPort: 8443, Fallback: 21003},
@@ -89,7 +113,16 @@ func oldApplyState() *State {
 		Argo:    &Argo{Host: "a.example.com", Inner: 21010, Web: 21011, UUID: "u", Path: "/old"}}
 }
 
-// 把旧状态和旧配置放到磁盘上，返回三份原字节
+// 新状态：Reality 换端口、Hy2 换跳跃范围、Argo 换路径（Xray 配置也要重写）
+func newApplyState() *State {
+	st := oldApplyState()
+	st.Reality.Port = 443
+	st.Hy2.HopStart, st.Hy2.HopEnd = 30000, 31000
+	st.Argo.Path = "/new"
+	return st
+}
+
+// 把旧状态、旧 sing-box 配置、旧 Xray 配置放到磁盘上，返回三份原字节
 func seedOld(t *testing.T) (st, sb, xr []byte) {
 	t.Helper()
 	oldApplyState().save()
@@ -114,6 +147,20 @@ func assertBytes(t *testing.T, what, path string, want []byte) {
 	}
 }
 
+// 回滚后：三份文件是旧字节，没回收放行规则，提示已回滚
+func assertRolledBack(t *testing.T, r *applyRec, out string, st, sb, xr []byte) {
+	t.Helper()
+	assertBytes(t, "state.json", statePath, st)
+	assertBytes(t, "sing-box 配置", sbConf, sb)
+	assertBytes(t, "Xray 配置", xrayConf, xr)
+	if r.prunes != 0 {
+		t.Fatal("没应用成功却回收了放行规则")
+	}
+	if !strings.Contains(out, "已回滚到原来的配置") {
+		t.Fatalf("没提示已回滚：\n%s", out)
+	}
+}
+
 // 新配置检查不过（sing-box 或 Xray）：磁盘上的状态和配置一个字节都不动，不碰服务，不回收放行规则，不留临时文件
 func TestApplyCheckFailLeavesDisk(t *testing.T) {
 	for _, bad := range []string{"sing-box", "xray"} {
@@ -127,18 +174,15 @@ func TestApplyCheckFailLeavesDisk(t *testing.T) {
 				}
 				return nil
 			}
-			st := oldApplyState()
-			st.Reality.Port = 443
-			st.Argo.Path = "/new" // Xray 配置也变了，两样都要检查
-			died, out := runApply(st)
+			died, out := runApply(newApplyState())
 			if !died || !strings.Contains(out, "检查不通过") {
 				t.Fatalf("检查不过应该 die：\n%s", out)
 			}
 			assertBytes(t, "state.json", statePath, st0)
 			assertBytes(t, "sing-box 配置", sbConf, sb0)
 			assertBytes(t, "Xray 配置", xrayConf, xr0)
-			if len(r.cmds) != 0 || len(r.hops) != 0 || r.prunes != 0 {
-				t.Fatalf("检查不过却动了服务或规则：%q hop=%v prune=%d", r.cmds, r.hops, r.prunes)
+			if len(r.cmds) != 0 || len(r.hops) != 0 || r.prunes != 0 || len(r.writes) != 0 {
+				t.Fatalf("检查不过却动了服务、规则或文件：%q hop=%v prune=%d write=%v", r.cmds, r.hops, r.prunes, r.writes)
 			}
 			if left, _ := os.ReadDir(strings.TrimSuffix(statePath, "/state.json")); len(left) != 3 {
 				t.Fatalf("临时文件没删干净：%v", left)
@@ -147,49 +191,166 @@ func TestApplyCheckFailLeavesDisk(t *testing.T) {
 	}
 }
 
-// 端口等不到：三份文件换回旧字节（原来没有的删掉），按旧状态重启服务、重加旧的跳跃规则，不回收放行规则
+// 就绪检查不过（TCP 端口、UDP 端口、托管的 cloudflared）：三份文件换回旧字节，
+// 按旧状态重启服务、重加旧的跳跃规则，不回收放行规则
 func TestApplyReadyFailRollsBack(t *testing.T) {
+	for _, tc := range []struct {
+		name, msg string
+		set       func(r *applyRec)
+	}{
+		{"TCP", "TCP 端口 443 没起来", func(r *applyRec) { r.tcp = func(p int) bool { return p != 443 } }},
+		{"UDP", "UDP 端口 5443 没起来", func(r *applyRec) { r.udp = func(p int) bool { return p != 5443 } }},
+		{"cloudflared", "cloudflared 服务 dun-argo 没起来", func(r *applyRec) {
+			r.fail = func(c string, _ int) error {
+				if c == "systemctl is-active --quiet dun-argo" {
+					return errors.New("inactive")
+				}
+				return nil
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := fakeApply(t)
+			st0, sb0, xr0 := seedOld(t)
+			tc.set(r)
+			webSawNew := false
+			r.onCmd = func(c string) {
+				if c == "systemctl restart dun" && !webSawNew {
+					// dun serve 按 state.json 定端口，重启它之前新状态必须已经落盘
+					webSawNew = loadState().Reality.Port == 443
+				}
+			}
+			died, out := runApply(newApplyState())
+			if !died || !strings.Contains(out, tc.msg) {
+				t.Fatalf("应该报 %q 后 die：\n%s", tc.msg, out)
+			}
+			if !webSawNew {
+				t.Fatal("重启 dun 服务时 state.json 还是旧的")
+			}
+			assertRolledBack(t, r, out, st0, sb0, xr0)
+			if !reflect.DeepEqual(r.hops, []int{30000, 20000}) {
+				t.Fatalf("跳跃规则应先按新状态、再按旧状态加：%v", r.hops)
+			}
+			for _, c := range []string{"systemctl restart dun-sb", "systemctl restart dun", "systemctl restart dun-xray"} {
+				if r.has(c) != 2 {
+					t.Fatalf("%q 应该新旧各一次：%q", c, r.cmds)
+				}
+			}
+		})
+	}
+}
+
+// 写配置失败：已经写下的新 state.json 换回去，按旧状态恢复服务
+func TestApplyWriteFailRollsBack(t *testing.T) {
+	r := fakeApply(t)
+	st0, sb0, xr0 := seedOld(t)
+	r.writeErr = func(p string, n int) error {
+		if p == sbConf && n == 1 {
+			return errors.New("disk full")
+		}
+		return nil
+	}
+	died, out := runApply(newApplyState())
+	if !died || !strings.Contains(out, "写配置失败") {
+		t.Fatalf("写失败应该 die：\n%s", out)
+	}
+	assertRolledBack(t, r, out, st0, sb0, xr0)
+	if r.has("systemctl restart dun-sb") != 1 || !reflect.DeepEqual(r.hops, []int{20000}) {
+		t.Fatalf("应该只按旧状态起一次服务：%q hop=%v", r.cmds, r.hops)
+	}
+}
+
+// 服务起不来：回滚。原来没有的 Xray 配置被删掉
+func TestApplyStartFailRollsBack(t *testing.T) {
 	r := fakeApply(t)
 	st0, sb0, _ := seedOld(t)
-	os.Remove(xrayConf) // 原来没有 Xray 配置：回滚时要删掉新写的
-	webSawNew := false
-	r.onCmd = func(c string) {
-		if c == "systemctl restart dun" && !webSawNew {
-			// dun serve 按 state.json 定端口，重启它之前新状态必须已经落盘
-			webSawNew = loadState().Reality.Port == 443
+	os.Remove(xrayConf)
+	r.fail = func(c string, n int) error {
+		if c == "systemctl restart dun-sb" && n == 1 {
+			return errors.New("exit 1")
 		}
+		return nil
 	}
-	r.ready = func(p int) bool { return p != 443 }
+	died, out := runApply(newApplyState())
+	if !died || !strings.Contains(out, "sing-box 服务起不来") {
+		t.Fatalf("起不来应该 die：\n%s", out)
+	}
+	assertRolledBack(t, r, out, st0, sb0, nil)
+	if r.has("systemctl restart dun-sb") != 2 {
+		t.Fatalf("回滚时应该按旧状态再起 sing-box：%q", r.cmds)
+	}
+}
+
+// 非空状态下要停的服务停不掉：算失败，回滚
+func TestApplyStopFailRollsBack(t *testing.T) {
+	r := fakeApply(t)
+	st0, sb0, xr0 := seedOld(t)
+	r.fail = func(c string, n int) error {
+		if c == "systemctl disable --now dun-sb" {
+			return errors.New("exit 1")
+		}
+		return nil
+	}
 	st := oldApplyState()
-	st.Reality.Port = 443
-	st.Hy2.HopStart, st.Hy2.HopEnd = 30000, 31000
+	st.Reality, st.Hy2 = nil, nil // 只剩 Argo，sing-box 要停
 	died, out := runApply(st)
-	if !died || !strings.Contains(out, "端口 443 没起来") || !strings.Contains(out, "已换回原来的配置") {
-		t.Fatalf("端口没起来应该回滚后 die：\n%s", out)
+	if !died || !strings.Contains(out, "sing-box 服务停不掉") {
+		t.Fatalf("停不掉应该 die：\n%s", out)
 	}
-	if !webSawNew {
-		t.Fatal("重启 dun 服务时 state.json 还是旧的")
+	assertRolledBack(t, r, out, st0, sb0, xr0)
+	if r.has("systemctl restart dun-sb") != 1 {
+		t.Fatalf("回滚时应该按旧状态起 sing-box：%q", r.cmds)
+	}
+}
+
+// 回滚时跳跃规则加不上：只记进错误，刚还原的 state.json 字节不变（不走关掉跳跃的写回）
+func TestApplyRollbackHopFailKeepsState(t *testing.T) {
+	r := fakeApply(t)
+	st0, sb0, xr0 := seedOld(t)
+	fakeFw(t, "", func(a []string) bool { return len(a) > 2 && a[1] == "nat" && a[2] == "-A" })
+	applyHop = hopRules
+	r.tcp = func(p int) bool { return p != 443 }
+	died, out := runApply(newApplyState())
+	if !died || !strings.Contains(out, "回滚未完全成功") || !strings.Contains(out, "端口跳跃规则 20000:21000 加不上") {
+		t.Fatalf("应该报回滚时跳跃加不上：\n%s", out)
 	}
 	assertBytes(t, "state.json", statePath, st0)
 	assertBytes(t, "sing-box 配置", sbConf, sb0)
-	assertBytes(t, "Xray 配置", xrayConf, nil)
-	if !reflect.DeepEqual(r.hops, []int{30000, 20000}) {
-		t.Fatalf("跳跃规则应先按新状态、再按旧状态加：%v", r.hops)
-	}
-	for _, c := range []string{"systemctl restart dun-sb", "systemctl restart dun", "systemctl restart dun-xray"} {
-		if r.has(c) != 2 {
-			t.Fatalf("%q 应该新旧各一次：%q", c, r.cmds)
+	assertBytes(t, "Xray 配置", xrayConf, xr0)
+}
+
+// 回滚中一步失败，其余步骤照做，错误汇总
+func TestApplyRollbackKeepsGoing(t *testing.T) {
+	r := fakeApply(t)
+	st0, _, xr0 := seedOld(t)
+	r.tcp = func(p int) bool { return p != 443 }
+	r.writeErr = func(p string, n int) error {
+		if p == sbConf && n == 2 {
+			return errors.New("ro fs")
 		}
+		return nil
 	}
-	if r.prunes != 0 {
-		t.Fatal("没应用成功却回收了放行规则")
+	r.fail = func(c string, n int) error {
+		if c == "systemctl restart dun-sb" && n == 2 {
+			return errors.New("exit 1")
+		}
+		return nil
+	}
+	died, out := runApply(newApplyState())
+	if !died || !strings.Contains(out, "回滚未完全成功") || !strings.Contains(out, "ro fs") || !strings.Contains(out, "sing-box 服务起不来") {
+		t.Fatalf("应该汇总两个回滚错误：\n%s", out)
+	}
+	assertBytes(t, "state.json", statePath, st0)
+	assertBytes(t, "Xray 配置", xrayConf, xr0)
+	if len(r.hops) != 2 || r.has("systemctl restart dun") != 2 || r.has("systemctl restart dun-xray") != 2 || r.prunes != 0 {
+		t.Fatalf("回滚出错后其余步骤没做完：%q hop=%v prune=%d", r.cmds, r.hops, r.prunes)
 	}
 }
 
 // 旧状态没有协议：回滚时按旧状态把服务停掉，不再重启
 func TestApplyRollbackToEmpty(t *testing.T) {
 	r := fakeApply(t)
-	r.ready = func(int) bool { return false }
+	r.tcp = func(int) bool { return false }
 	st := oldApplyState()
 	st.Argo = nil
 	died, _ := runApply(st)
@@ -204,17 +365,25 @@ func TestApplyRollbackToEmpty(t *testing.T) {
 	}
 }
 
+// 卸到没有协议：和以前一样，停服务出错只提示，照样回收规则
+func TestApplyEmptyKeepsBaseline(t *testing.T) {
+	r := fakeApply(t)
+	seedOld(t)
+	r.fail = func(string, int) error { return errors.New("exit 1") }
+	died, out := runApply(&State{})
+	if died || !strings.Contains(out, "没有协议了") || r.prunes != 1 {
+		t.Fatalf("空状态应该照旧停服务、回收规则：die=%v prune=%d\n%s", died, r.prunes, out)
+	}
+}
+
 // 都起来了：新配置落盘，放行规则回收一次
 func TestApplySuccess(t *testing.T) {
 	r := fakeApply(t)
 	seedOld(t)
-	st := oldApplyState()
-	st.Reality.Port = 443
-	st.Argo.Path = "/new"
-	if died, out := runApply(st); died || !strings.Contains(out, "服务已运行") {
+	if died, out := runApply(newApplyState()); died || !strings.Contains(out, "服务已运行") {
 		t.Fatalf("应该成功：\n%s", out)
 	}
-	if r.prunes != 1 || loadState().Reality.Port != 443 || !reflect.DeepEqual(r.hops, []int{20000}) {
+	if r.prunes != 1 || loadState().Reality.Port != 443 || !reflect.DeepEqual(r.hops, []int{30000}) {
 		t.Fatalf("成功后状态不对：prune=%d hop=%v", r.prunes, r.hops)
 	}
 	if b, _ := os.ReadFile(xrayConf); !strings.Contains(string(b), `"/new"`) {
@@ -291,6 +460,76 @@ func TestPlaceBinFreshFail(t *testing.T) {
 	assertBytes(t, ".new", bin+".new", nil)
 }
 
+// 换回 .old 失败：不重启服务（免得起坏的），.old 留着，打出手动恢复的命令
+func TestRollbackBinRenameFail(t *testing.T) {
+	r := fakeApply(t)
+	bin := t.TempDir() + "/sing-box"
+	os.MkdirAll(bin+"/busy", 0755) // bin 是个非空目录，.old 改不过去
+	os.WriteFile(bin+".old", []byte("OLD"), 0755)
+	out := captureStderr(func() { rollbackBin(bin, svcBox, true) })
+	if len(r.cmds) != 0 || !strings.Contains(out, "mv "+bin+".old "+bin+" && systemctl restart dun-sb") {
+		t.Fatalf("换不回去时不该重启，要给出手动命令：%q\n%s", r.cmds, out)
+	}
+	assertBytes(t, ".old", bin+".old", []byte("OLD"))
+}
+
+// 菜单 15 更新 cloudflared 的回退：有原文件时换回去再重启；原来没有时删掉残留的 .old、不回退、不重启
+func TestUpdateCfdRollback(t *testing.T) {
+	for _, tc := range []struct {
+		name                string
+		had                 bool
+		failRestart, failUp bool
+		bin, old            string // 结束后的 bin 和 .old，"" = 不存在
+		restarts            int
+	}{
+		{"重启失败换回旧的", true, true, false, "OLD", "", 2},
+		{"起来又停了换回旧的", true, false, true, "OLD", "", 2},
+		{"原来没有不回退", false, false, true, "NEW", "", 1},
+		{"成功", true, false, false, "NEW", "", 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := fakeApply(t)
+			fakeInstall(t)
+			osl, oin, oeof := sleep, in, eofIn
+			t.Cleanup(func() { sleep, in, eofIn = osl, oin, oeof })
+			sleep = func(time.Duration) {}
+			if tc.had {
+				os.WriteFile(cfdBin, []byte("OLD"), 0755)
+			} else {
+				os.WriteFile(cfdBin+".old", []byte("STALE"), 0755) // 上次留下的
+			}
+			ghLatest = func(string) string { return "2026.12.0" }
+			dlVerified = func(repo, tag, name, dst string, mode os.FileMode) error {
+				return os.WriteFile(dst, []byte("NEW"), mode)
+			}
+			runOut = func(name string, args ...string) (string, error) {
+				if !exists(name) {
+					return "", errors.New("not found")
+				}
+				return "cloudflared version 2026.11.2 (built 2026-11-01)", nil
+			}
+			r.fail = func(c string, n int) error {
+				if tc.failRestart && c == "systemctl restart dun-argo" && n == 1 ||
+					tc.failUp && c == "systemctl is-active --quiet dun-argo" {
+					return errors.New("exit 1")
+				}
+				return nil
+			}
+			in = bufio.NewReader(strings.NewReader("2\n"))
+			out := captureStderr(func() {
+				defer func() { recover() }()
+				updateCfd()
+			})
+			want := map[string][]byte{"": nil, "OLD": []byte("OLD"), "NEW": []byte("NEW")}
+			assertBytes(t, "cloudflared", cfdBin, want[tc.bin])
+			assertBytes(t, ".old", cfdBin+".old", want[tc.old])
+			if r.has("systemctl restart dun-argo") != tc.restarts {
+				t.Fatalf("重启次数不对：%q\n%s", r.cmds, out)
+			}
+		})
+	}
+}
+
 // 替身：记下下载的版本，下载直接失败（die），不联网
 func fakeInstall(t *testing.T) *[]string {
 	t.Helper()
@@ -337,8 +576,11 @@ func TestVcmp(t *testing.T) {
 	}
 }
 
-// 菜单 15：只用 ghLatest 查上游正式版，按当前、推荐、最新给选项，最后装的版本对
+// 菜单 15：只用 ghLatest 查上游正式版，按当前、推荐、最新列选项；回车和读到头都不更新；
+// 比当前旧的写明「降级到」，还要再确认一次
 func TestUpdateCorePick(t *testing.T) {
+	oin, oeof := in, eofIn
+	t.Cleanup(func() { in, eofIn = oin, oeof })
 	type core struct {
 		update      func()
 		repo, ver   string // ver 输出的格式
@@ -351,37 +593,50 @@ func TestUpdateCorePick(t *testing.T) {
 	}
 	older := map[string]string{"sing-box": "1.13.2", "Xray": "25.12.8", "cloudflared": "2025.11.1"}
 	newer := map[string]string{"sing-box": "1.15.0", "Xray": "26.12.1", "cloudflared": "2026.12.0"}
+	top := map[string]string{"sing-box": "1.16.0", "Xray": "27.1.1", "cloudflared": "2027.1.0"}
 	for name, c := range cores {
 		for _, tc := range []struct {
 			cur, latest, input string
 			want               string // 装的版本，空 = 不装
+			shows              string // 输出里要有的选项
 		}{
-			{"older", "newer", "\n", "pinned"}, // 当前 < 推荐 < 最新：默认装推荐
-			{"older", "newer", "2\n", "newer"},
-			{"older", "newer", "3\n", ""},
-			{"older", "newer", "0\n", ""},
-			{"pinned", "newer", "\n", ""}, // 当前 == 推荐 < 最新：默认不升
-			{"pinned", "newer", "y\n", "newer"},
-			{"newer", "newer", "\n", ""}, // 已是最新：默认不重装
-			{"newer", "newer", "y\n", "newer"},
-			{"older", "pinned", "\n", "pinned"}, // 最新就是推荐
-			{"older", "", "\n", "pinned"},       // 查不到上游：还能装推荐版
-			{"pinned", "", "\n", ""},
+			{"older", "newer", "\n", "", "1. 升到推荐版本"}, // 当前 < 推荐 < 最新：回车不更新
+			{"older", "newer", "", "", "2. 升到最新正式版"},  // 读到头不更新
+			{"older", "newer", "1\n", "pinned", ""},
+			{"older", "newer", "2\n", "newer", ""},
+			{"older", "newer", "3\n", "", ""},
+			{"older", "newer", "x\n", "", ""},
+			{"pinned", "newer", "\n", "", "1. 重装推荐版本"}, // 当前 == 推荐 < 最新
+			{"pinned", "newer", "2\n", "newer", ""},
+			{"newer", "newer", "\n", "", "2. 重装最新正式版"}, // 已是最新
+			{"newer", "newer", "2\n", "newer", ""},
+			{"newer", "newer", "1\n", "", "1. 降级到推荐版本"}, // 降级要再确认，默认否
+			{"newer", "newer", "1\n\n", "", ""},
+			{"newer", "newer", "1\ny\n", "pinned", ""},
+			{"top", "newer", "2\n", "", "2. 降级到最新正式版"}, // 当前比上游最新还新
+			{"top", "newer", "2\ny\n", "newer", ""},
+			{"older", "pinned", "1\n", "pinned", "1. 升到推荐版本"}, // 最新就是推荐，只列一项
+			{"older", "", "\n", "", "1. 升到推荐版本"},              // 查不到上游：还能装推荐版
+			{"older", "", "", "", ""},
+			{"older", "", "1\n", "pinned", ""},
+			{"top", "", "1\n", "", "1. 降级到推荐版本"},
+			{"top", "", "1\ny\n", "pinned", ""},
+			{"pinned", "", "1\n", "", "已经是推荐版本"},
 		} {
-			v := map[string]string{"older": older[name], "newer": newer[name], "pinned": c.pinned, "": ""}
+			v := map[string]string{"older": older[name], "newer": newer[name], "top": top[name], "pinned": c.pinned, "": ""}
 			got := fakeInstall(t)
 			var asked []string
 			ghLatest = func(repo string) string { asked = append(asked, repo); return v[tc.latest] }
-			oout, oin := runOut, in
+			oout := runOut
 			runOut = func(string, ...string) (string, error) {
-				return strings.Replace(c.ver, "%s", v[tc.cur], 1), nil
+				return fmt.Sprintf(c.ver, v[tc.cur]), nil
 			}
 			in = bufio.NewReader(strings.NewReader(tc.input))
 			out := captureStderr(func() {
 				defer func() { recover() }()
 				c.update()
 			})
-			runOut, in = oout, oin
+			runOut = oout
 			var want []string
 			if tc.want != "" {
 				want = []string{c.repo + " " + c.tag + v[tc.want]}
@@ -390,8 +645,11 @@ func TestUpdateCorePick(t *testing.T) {
 				t.Fatalf("%s 当前 %s 最新 %q 输入 %q：装了 %q 查了 %q，应装 %q\n%s",
 					name, tc.cur, v[tc.latest], tc.input, *got, asked, want, out)
 			}
-			if !strings.Contains(out, "推荐 "+c.pinned) || !strings.Contains(out, "当前 "+v[tc.cur]) {
-				t.Fatalf("%s 没列出当前和推荐版本：\n%s", name, out)
+			if !strings.Contains(out, "推荐 "+c.pinned) || !strings.Contains(out, "当前 "+v[tc.cur]) || !strings.Contains(out, tc.shows) {
+				t.Fatalf("%s 当前 %s 最新 %q：输出里没有当前、推荐版本或 %q：\n%s", name, tc.cur, v[tc.latest], tc.shows, out)
+			}
+			if tc.latest == "" && strings.Contains(out, "最新正式版") {
+				t.Fatalf("查不到上游时不该列最新正式版：\n%s", out)
 			}
 		}
 	}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 )
@@ -180,20 +181,34 @@ type State struct {
 }
 
 func loadState() *State {
-	st := &State{}
-	if b, err := os.ReadFile(statePath); err == nil {
-		if err := json.Unmarshal(b, st); err != nil {
-			die("状态文件 %s 损坏: %v", statePath, err)
-		}
+	st, err := readState()
+	if err != nil {
+		die("%v", err)
 	}
 	return st
 }
 
+// 和 loadState 一样，出错返回 error 不退出
+func readState() (*State, error) {
+	st := &State{}
+	if b, err := os.ReadFile(statePath); err == nil {
+		if err := json.Unmarshal(b, st); err != nil {
+			return nil, fmt.Errorf("状态文件 %s 损坏: %v", statePath, err)
+		}
+	}
+	return st, nil
+}
+
 func (s *State) save() {
-	b, _ := json.MarshalIndent(s, "", "  ")
-	if err := writeFileAtomic(statePath, b, 0600); err != nil {
+	if err := s.write(); err != nil {
 		die("保存状态失败: %v", err)
 	}
+}
+
+// 和 save 一样，出错返回 error 不退出
+func (s *State) write() error {
+	b, _ := json.MarshalIndent(s, "", "  ")
+	return writeFileAtomic(statePath, b, 0600)
 }
 
 func (s *State) installed() bool {
