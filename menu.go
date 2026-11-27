@@ -502,15 +502,12 @@ func updateCore(st *State) {
 }
 
 func updateSingBox(st *State) {
-	cur, latest := sbVersion(), ghLatest("SagerNet/sing-box")
-	if latest == "" {
-		warn("拿不到 sing-box 最新版本号")
+	cur := sbVersion()
+	ver := pickVersion("sing-box", cur, sbPinned, ghLatest("SagerNet/sing-box"))
+	if ver == "" {
 		return
 	}
-	if cur == latest && !confirm("sing-box 已经是最新 "+cur+"，还要重装？", false) {
-		return
-	}
-	sbInstall(latest)
+	sbInstall(ver)
 	if _, n := sbConfig(st); n > 0 {
 		out, err := runOut(sbBin, "check", "-c", sbConf)
 		if err == nil {
@@ -519,13 +516,13 @@ func updateSingBox(st *State) {
 		}
 		if err != nil || !svcActive(svcBox) {
 			warn("新版本跑不起来，回退到 %s\n%s", cur, out)
-			os.Rename(sbBin+".old", sbBin)
+			restoreOld(sbBin)
 			svcDo("restart", svcBox)
 			return
 		}
 	}
 	os.Remove(sbBin + ".old")
-	ok("sing-box 已更新到 %s", latest)
+	ok("sing-box 已更新到 %s", ver)
 }
 
 func updateSelf() {

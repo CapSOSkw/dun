@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"encoding/json"
 	"fmt"
@@ -23,8 +24,18 @@ func sbArch() string {
 	}
 }
 
-// 跟 releases/latest 的跳转拿版本号，不走 API，免得被限流
-func ghLatest(repo string) string {
+// 不带版本安装时装的内核版本，都是验证过的；菜单 15 可以换成上游最新的正式版
+const (
+	sbPinned   = "1.14.5"
+	xrayPinned = "26.11.9"
+	cfdPinned  = "2026.11.2"
+)
+
+// 测试里换成替身，不联网
+var dlVerified = downloadVerified
+
+// 跟 releases/latest 的跳转拿版本号，不走 API，免得被限流。releases/latest 只指向正式版
+var ghLatest = func(repo string) string {
 	c := &http.Client{Timeout: 20 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	resp, err := c.Get("https://github.com/" + repo + "/releases/latest")
 	if err != nil {
@@ -38,31 +49,90 @@ func ghLatest(repo string) string {
 	return ""
 }
 
-func sbVersion() string {
-	out, err := runOut(sbBin, "version")
-	if err != nil {
+// 第一行形如 sing-box version 1.14.5
+func sbVersionAt(bin string) string { return binVersion(bin, 2, "version") }
+func sbVersion() string             { return sbVersionAt(sbBin) }
+
+// 版本号按数字段比较："1.14.5" < "1.15.0"，"2026.9.1" < "2026.11.2"。空串比谁都小
+func vcmp(a, b string) int {
+	pa, pb := strings.Split(strings.TrimPrefix(a, "v"), "."), strings.Split(strings.TrimPrefix(b, "v"), ".")
+	seg := func(p []string, i int) int {
+		n := 0
+		if i < len(p) {
+			for _, c := range p[i] {
+				if c < '0' || c > '9' {
+					break
+				}
+				n = n*10 + int(c-'0')
+			}
+		}
+		return n
+	}
+	for i := 0; i < len(pa) || i < len(pb); i++ {
+		if x, y := seg(pa, i), seg(pb, i); x != y {
+			if x < y {
+				return -1
+			}
+			return 1
+		}
+	}
+	return 0
+}
+
+// 菜单 15：列出当前、推荐、上游最新正式版，问装哪个；返回 "" = 不更新
+func pickVersion(name, cur, pinned, latest string) string {
+	show := cur
+	if show == "" {
+		show = "未知"
+	}
+	if latest == "" {
+		info("%s 当前 %s，推荐 %s；拿不到上游最新版本号", name, show, pinned)
+		if cur == pinned {
+			warn("%s 已经是推荐版本，先不更新", name)
+			return ""
+		}
+		if confirm(fmt.Sprintf("装推荐版本 %s？", pinned), vcmp(cur, pinned) < 0) {
+			return pinned
+		}
 		return ""
 	}
-	f := strings.Fields(strings.SplitN(out, "\n", 2)[0])
-	if len(f) >= 3 {
-		return f[2]
+	info("%s 当前 %s，推荐 %s，上游最新正式版 %s", name, show, pinned, latest)
+	switch {
+	case vcmp(cur, pinned) < 0 && vcmp(latest, pinned) > 0:
+		switch choose([]string{"升到推荐版本 " + pinned, "升到最新正式版 " + latest, "不更新"}, 1) {
+		case 0:
+			return pinned
+		case 1:
+			return latest
+		}
+		return ""
+	case vcmp(cur, latest) >= 0:
+		if confirm(name+" 已经是最新 "+cur+"，还要重装？", false) {
+			return latest
+		}
+		return ""
+	case vcmp(cur, pinned) < 0:
+		if confirm(fmt.Sprintf("升到推荐版本 %s？", pinned), true) {
+			return pinned
+		}
+		return ""
+	}
+	if confirm(fmt.Sprintf("升到最新正式版 %s？", latest), false) {
+		return latest
 	}
 	return ""
 }
 
 func sbInstall(ver string) {
 	if ver == "" {
-		ver = ghLatest("SagerNet/sing-box")
-	}
-	if ver == "" {
-		die("拿不到 sing-box 最新版本号，检查能不能访问 GitHub")
+		ver = sbPinned
 	}
 	name := fmt.Sprintf("sing-box-%s-linux-%s.tar.gz", ver, sbArch())
 	info("下载 sing-box %s (%s)", ver, sbArch())
 	os.MkdirAll(path.Dir(sbBin), 0755)
 	tgz := sbBin + ".tar.gz"
 	defer os.Remove(tgz)
-	if err := downloadVerified("SagerNet/sing-box", "v"+ver, name, tgz, 0600); err != nil {
+	if err := dlVerified("SagerNet/sing-box", "v"+ver, name, tgz, 0600); err != nil {
 		die("sing-box 下载失败：%v", err)
 	}
 	pkg, err := os.Open(tgz)
@@ -90,17 +160,12 @@ func sbInstall(ver string) {
 		_, err = io.Copy(f, tr)
 		f.Close()
 		if err != nil {
+			os.Remove(sbBin + ".new")
 			die("sing-box 下载不完整: %v", err)
 		}
 		break
 	}
-	if exists(sbBin) {
-		os.Rename(sbBin, sbBin+".old")
-	}
-	os.Rename(sbBin+".new", sbBin)
-	if sbVersion() == "" {
-		die("sing-box 跑不起来")
-	}
+	placeBin(sbBin, "sing-box", sbVersionAt)
 	ok("sing-box %s", sbVersion())
 }
 
@@ -169,35 +234,96 @@ func sbConfig(st *State) (map[string]any, int) {
 	}, len(inb)
 }
 
-// 先 check 再替换，检查不过旧配置不动
+// applyAll 的外部副作用，测试里换成替身
+var (
+	portReady  = func(p int) bool { return portOwner(p) == "ours" }
+	udpReady   = udpListening
+	applyPrune = fwPrune
+	applyHop   = hopApply
+	applyLog   = func() { svcLog(30, false) }
+	readyWait  = 300 * time.Millisecond
+)
+
+// 新配置写到临时文件检查，检查完临时文件删掉
+func checkConf(tmp string, b []byte, bin string, args ...string) (string, error) {
+	defer os.Remove(tmp)
+	if err := os.WriteFile(tmp, b, 0600); err != nil {
+		return err.Error(), err
+	}
+	out, err := runOut(bin, append(args, tmp)...)
+	if err != nil && out == "" { // 没输出（比如内核文件不在）就把错误本身打出来
+		out = err.Error()
+	}
+	return out, err
+}
+
+type fileSnap struct {
+	path string
+	data []byte
+	had  bool
+}
+
+// 应用前的磁盘原样；原来不存在的文件回滚时删掉
+func snapFiles(paths ...string) []fileSnap {
+	var snap []fileSnap
+	for _, p := range paths {
+		b, err := os.ReadFile(p)
+		if err != nil && !os.IsNotExist(err) {
+			die("读不到 %s，没动任何配置: %v", p, err)
+		}
+		snap = append(snap, fileSnap{p, b, err == nil})
+	}
+	return snap
+}
+
+// 分两步，不留半态：
+//  1. 新配置写到临时文件检查，不过就退出，磁盘上的状态、配置和正在跑的服务都不动
+//  2. 记下旧文件，换上新状态和新配置再起服务、等端口；中途失败就换回旧文件、按旧状态恢复服务再退出。
+//     旧的放行规则只在全部就绪后才回收
 func applyAll(st *State) {
-	st.save()
 	cfg, n := sbConfig(st)
-	b, _ := json.MarshalIndent(cfg, "", "  ")
-	if n == 0 {
-		writeFileAtomic(sbConf, b, 0600)
-		svcDisable(svcBox)
-	} else {
-		tmp := sbConf + ".check"
-		os.WriteFile(tmp, b, 0600)
-		if out, err := runOut(sbBin, "check", "-c", tmp); err != nil {
-			os.Remove(tmp)
+	sbNew, _ := json.MarshalIndent(cfg, "", "  ")
+	stNew, _ := json.MarshalIndent(st, "", "  ")
+	var xrNew []byte
+	xrChanged := false
+	if st.Argo != nil {
+		xrNew, _ = json.MarshalIndent(xrayConfig(st), "", "  ")
+		cur, _ := os.ReadFile(xrayConf)
+		xrChanged = !bytes.Equal(cur, xrNew)
+	}
+	if n > 0 {
+		if out, err := checkConf(sbConf+".check", sbNew, sbBin, "check", "-c"); err != nil {
 			die("sing-box 配置检查不通过，旧配置没动:\n%s", out)
 		}
-		os.Rename(tmp, sbConf)
-		svcEnable(svcBox)
-		svcDo("restart", svcBox)
 	}
-	hopApply(st)
-	xrayApply(st)
-	if st.installed() {
-		svcEnable(svcWeb)
-		svcDo("restart", svcWeb)
-	} else {
-		svcDisable(svcWeb)
+	if xrChanged { // Xray 按扩展名认格式，临时文件得是 .json
+		if out, err := checkConf(strings.TrimSuffix(xrayConf, ".json")+".check.json", xrNew, xrayBin, "run", "-test", "-c"); err != nil {
+			die("Xray 配置检查不通过，旧配置没动:\n%s", out)
+		}
+	}
+
+	old := snapFiles(statePath, sbConf, xrayConf)
+	fail := func(f string, a ...any) {
+		warn(f, a...)
+		applyRollback(old, xrChanged)
+		die("没应用成功，已换回原来的配置")
+	}
+	// dun serve 启动时按 state.json 定监听端口，所以先换状态再重启服务
+	err := writeFileAtomic(statePath, stNew, 0600)
+	if err == nil {
+		err = writeFileAtomic(sbConf, sbNew, 0600)
+	}
+	if err == nil && xrChanged {
+		err = writeFileAtomic(xrayConf, xrNew, 0600)
+	}
+	if err != nil {
+		fail("写配置失败: %v", err)
+	}
+	if err := startServices(st, xrChanged); err != nil {
+		fail("%v", err)
 	}
 	if !st.installed() {
-		fwPrune(st)
+		applyPrune(st)
 		info("没有协议了，服务已停")
 		return
 	}
@@ -222,28 +348,78 @@ func applyAll(st *State) {
 	if st.TUIC != nil {
 		udp = append(udp, st.TUIC.Port)
 	}
+	bad := 0
 	for i := 0; i < 20; i++ {
-		bad := 0
+		if i > 0 {
+			time.Sleep(readyWait)
+		}
+		bad = 0
 		for _, p := range want {
-			if portOwner(p) != "ours" {
+			if !portReady(p) {
 				bad = p
 			}
 		}
 		for _, p := range udp {
-			if !udpListening(p) {
+			if !udpReady(p) {
 				bad = p
 			}
 		}
 		if bad == 0 {
-			fwPrune(st)
+			applyPrune(st)
 			ok("服务已运行")
 			return
 		}
-		if i == 19 {
-			svcLog(30, false)
-			die("端口 %d 没起来，看上面的日志", bad)
+	}
+	applyLog()
+	fail("端口 %d 没起来，看上面的日志", bad)
+}
+
+// 按 st 起停所有服务；applyAll 和回滚共用
+func startServices(st *State, xrChanged bool) error {
+	if _, n := sbConfig(st); n == 0 {
+		svcDisable(svcBox)
+	} else {
+		svcEnable(svcBox)
+		if err := svcDo("restart", svcBox); err != nil {
+			return fmt.Errorf("sing-box 服务起不来: %v", err)
 		}
-		time.Sleep(300 * time.Millisecond)
+	}
+	applyHop(st)
+	if err := xrayApply(st, xrChanged); err != nil {
+		return err
+	}
+	if !st.installed() {
+		svcDisable(svcWeb)
+		return nil
+	}
+	svcEnable(svcWeb)
+	if err := svcDo("restart", svcWeb); err != nil {
+		return fmt.Errorf("dun 服务起不来: %v", err)
+	}
+	return nil
+}
+
+// 换回 applyAll 之前的文件，按旧状态重新加跳跃规则、起停服务。不回收放行规则
+func applyRollback(old []fileSnap, xrChanged bool) {
+	prev := &State{}
+	for _, f := range old {
+		var err error
+		if f.had {
+			err = writeFileAtomic(f.path, f.data, 0600)
+		} else if err = os.Remove(f.path); os.IsNotExist(err) {
+			err = nil
+		}
+		if err != nil {
+			warn("还原 %s 失败: %v", f.path, err)
+		}
+		if f.path == statePath && f.had {
+			if err := json.Unmarshal(f.data, prev); err != nil {
+				warn("旧状态文件解析不了: %v", err)
+			}
+		}
+	}
+	if err := startServices(prev, xrChanged); err != nil {
+		warn("按原来的配置恢复服务也失败了: %v", err)
 	}
 }
 

@@ -2,7 +2,6 @@ package main
 
 import (
 	"archive/zip"
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -42,21 +41,47 @@ func binVersion(bin string, field int, args ...string) string {
 }
 
 // 第一行形如 Xray 26.11.9 (Xray, Penetrates Everything.) ...
-func xrayVersion() string { return binVersion(xrayBin, 1, "version") }
+func xrayVersionAt(bin string) string { return binVersion(bin, 1, "version") }
+func xrayVersion() string             { return xrayVersionAt(xrayBin) }
 
 // 第一行形如 cloudflared version 2026.11.2 (built ...)
-func cfdVersion() string { return binVersion(cfdBin, 2, "--version") }
+func cfdVersionAt(bin string) string { return binVersion(bin, 2, "--version") }
+func cfdVersion() string             { return cfdVersionAt(cfdBin) }
 
-// 新文件先放在 .new；换上去跑不起来就换回旧的。旧的留成 .old，更新失败时回退用
-func placeBin(bin, name string, ver func() string) {
-	if exists(bin) {
-		os.Rename(bin, bin+".old")
+// 新文件先放在 .new，自己能跑才换上去，跑不起来就删掉，原来的不动；
+// 换上去以后跑不起来就换回旧的。旧的留成 .old，更新后服务起不来时回退用
+func placeBin(bin, name string, ver func(string) string) {
+	if ver(bin+".new") == "" {
+		os.Remove(bin + ".new")
+		die("新下载的 %s 跑不起来，原来的没动", name)
 	}
-	os.Rename(bin+".new", bin)
-	if ver() == "" {
+	had := exists(bin)
+	if had {
+		if err := os.Rename(bin, bin+".old"); err != nil {
+			os.Remove(bin + ".new")
+			die("%s 换不上去，原来的没动: %v", name, err)
+		}
+	}
+	err := os.Rename(bin+".new", bin)
+	if err == nil && ver(bin) == "" {
+		err = fmt.Errorf("换上去跑不起来")
+	}
+	if err != nil {
+		os.Remove(bin + ".new")
 		os.Remove(bin)
-		os.Rename(bin+".old", bin)
-		die("%s 跑不起来", name)
+		if had {
+			if rerr := os.Rename(bin+".old", bin); rerr != nil {
+				warn("换回原来的 %s 失败，手动把 %s.old 改回 %s: %v", name, bin, bin, rerr)
+			}
+		}
+		die("%s %v，已换回原来的", name, err)
+	}
+}
+
+// 更新后服务起不来时换回 .old
+func restoreOld(bin string) {
+	if err := os.Rename(bin+".old", bin); err != nil {
+		warn("换回旧版本失败，手动把 %s.old 改回 %s: %v", bin, bin, err)
 	}
 }
 
@@ -90,10 +115,7 @@ func unzipOne(zf, name, dst string) error {
 
 func xrayInstall(ver string) {
 	if ver == "" {
-		ver = ghLatest("XTLS/Xray-core")
-	}
-	if ver == "" {
-		die("拿不到 Xray 最新版本号，检查能不能访问 GitHub")
+		ver = xrayPinned
 	}
 	arch := map[string]string{"amd64": "64", "arm64": "arm64-v8a"}[runtime.GOARCH]
 	if arch == "" {
@@ -103,32 +125,30 @@ func xrayInstall(ver string) {
 	os.MkdirAll(path.Dir(xrayBin), 0755)
 	zf := xrayBin + ".zip"
 	defer os.Remove(zf)
-	if err := downloadVerified("XTLS/Xray-core", "v"+ver, "Xray-linux-"+arch+".zip", zf, 0600); err != nil {
+	if err := dlVerified("XTLS/Xray-core", "v"+ver, "Xray-linux-"+arch+".zip", zf, 0600); err != nil {
 		die("Xray 下载失败: %v", err)
 	}
 	if err := unzipOne(zf, "xray", xrayBin+".new"); err != nil {
+		os.Remove(xrayBin + ".new")
 		die("Xray 包解不开: %v", err)
 	}
-	placeBin(xrayBin, "Xray", xrayVersion)
+	placeBin(xrayBin, "Xray", xrayVersionAt)
 	ok("Xray %s", xrayVersion())
 }
 
 func cfdInstall(ver string) {
 	if ver == "" {
-		ver = ghLatest("cloudflare/cloudflared")
-	}
-	if ver == "" {
-		die("拿不到 cloudflared 最新版本号，检查能不能访问 GitHub")
+		ver = cfdPinned
 	}
 	if runtime.GOARCH != "amd64" && runtime.GOARCH != "arm64" {
 		die("cloudflared 暂不支持 %s", runtime.GOARCH)
 	}
 	info("下载 cloudflared %s", ver)
 	os.MkdirAll(path.Dir(cfdBin), 0755)
-	if err := downloadVerified("cloudflare/cloudflared", ver, "cloudflared-linux-"+runtime.GOARCH, cfdBin+".new", 0755); err != nil {
+	if err := dlVerified("cloudflare/cloudflared", ver, "cloudflared-linux-"+runtime.GOARCH, cfdBin+".new", 0755); err != nil {
 		die("cloudflared 下载失败: %v", err)
 	}
-	placeBin(cfdBin, "cloudflared", cfdVersion)
+	placeBin(cfdBin, "cloudflared", cfdVersionAt)
 	ok("cloudflared %s", cfdVersion())
 }
 
@@ -176,42 +196,41 @@ func svcExists(name string) bool {
 	return exists("/etc/systemd/system/"+name+".service") || exists("/etc/init.d/"+name)
 }
 
-// 由 applyAll 调用。Xray 配置先检查再替换，没变就不重启，免得 Argo 节点断线；
+// 由 applyAll 调用，Xray 配置已经检查过、换好了。配置没变就不重启，免得 Argo 节点断线；
 // cloudflared 的路由在 CF 上，平时也不用重启它
-func xrayApply(st *State) {
+func xrayApply(st *State, changed bool) error {
 	if st.Argo == nil {
 		for _, s := range []string{svcArgo, svcXray} {
 			if svcExists(s) {
 				svcDisable(s)
 			}
 		}
-		return
+		return nil
 	}
-	b, _ := json.MarshalIndent(xrayConfig(st), "", "  ")
-	if cur, _ := os.ReadFile(xrayConf); !bytes.Equal(cur, b) {
-		tmp := baseDir + "/xray.check.json" // Xray 按扩展名认格式，得是 .json
-		os.WriteFile(tmp, b, 0600)
-		if out, err := runOut(xrayBin, "run", "-test", "-c", tmp); err != nil {
-			os.Remove(tmp)
-			die("Xray 配置检查不通过，旧配置没动:\n%s", out)
-		}
-		os.Rename(tmp, xrayConf)
+	var err error
+	if changed {
 		svcEnable(svcXray)
-		svcDo("restart", svcXray)
+		err = svcDo("restart", svcXray)
 	} else if !svcActive(svcXray) {
 		svcEnable(svcXray)
-		svcDo("start", svcXray)
+		err = svcDo("start", svcXray)
+	}
+	if err != nil {
+		return fmt.Errorf("Xray 服务起不来: %v", err)
 	}
 	if st.Argo.External { // 复用的隧道由这台机器上别的 cloudflared 在跑，dun 不再起一个
 		if svcExists(svcArgo) && svcActive(svcArgo) {
 			svcDisable(svcArgo)
 		}
-		return
+		return nil
 	}
 	svcEnable(svcArgo)
 	if !svcActive(svcArgo) {
-		svcDo("start", svcArgo)
+		if err := svcDo("start", svcArgo); err != nil {
+			return fmt.Errorf("cloudflared 服务起不来: %v", err)
+		}
 	}
+	return nil
 }
 
 // ── 隧道 ─────────────────────────────────────────────
@@ -942,15 +961,12 @@ func runTunnel() {
 
 // ── 更新 ─────────────────────────────────────────────
 func updateXray() {
-	cur, latest := xrayVersion(), ghLatest("XTLS/Xray-core")
-	if latest == "" {
-		warn("拿不到 Xray 最新版本号")
+	cur := xrayVersion()
+	ver := pickVersion("Xray", cur, xrayPinned, ghLatest("XTLS/Xray-core"))
+	if ver == "" {
 		return
 	}
-	if cur == latest && !confirm("Xray 已经是最新 "+cur+"，还要重装？", false) {
-		return
-	}
-	xrayInstall(latest)
+	xrayInstall(ver)
 	out, err := runOut(xrayBin, "run", "-test", "-c", xrayConf)
 	if err == nil {
 		svcDo("restart", svcXray)
@@ -958,32 +974,29 @@ func updateXray() {
 	}
 	if err != nil || !svcActive(svcXray) {
 		warn("新版本 Xray 跑不起来，回退到 %s\n%s", cur, out)
-		os.Rename(xrayBin+".old", xrayBin)
+		restoreOld(xrayBin)
 		svcDo("restart", svcXray)
 		return
 	}
 	os.Remove(xrayBin + ".old")
-	ok("Xray 已更新到 %s", latest)
+	ok("Xray 已更新到 %s", ver)
 }
 
 func updateCfd() {
-	cur, latest := cfdVersion(), ghLatest("cloudflare/cloudflared")
-	if latest == "" {
-		warn("拿不到 cloudflared 最新版本号")
+	cur := cfdVersion()
+	ver := pickVersion("cloudflared", cur, cfdPinned, ghLatest("cloudflare/cloudflared"))
+	if ver == "" {
 		return
 	}
-	if cur == latest && !confirm("cloudflared 已经是最新 "+cur+"，还要重装？", false) {
-		return
-	}
-	cfdInstall(latest)
+	cfdInstall(ver)
 	svcDo("restart", svcArgo)
 	time.Sleep(3 * time.Second)
 	if !svcActive(svcArgo) {
 		warn("新版本 cloudflared 跑不起来，回退到 %s", cur)
-		os.Rename(cfdBin+".old", cfdBin)
+		restoreOld(cfdBin)
 		svcDo("restart", svcArgo)
 		return
 	}
 	os.Remove(cfdBin + ".old")
-	ok("cloudflared 已更新到 %s", latest)
+	ok("cloudflared 已更新到 %s", ver)
 }

@@ -44,11 +44,12 @@ func have(c string) bool   { _, err := exec.LookPath(c); return err == nil }
 func isDir(p string) bool  { fi, err := os.Stat(p); return err == nil && fi.IsDir() }
 func exists(p string) bool { _, err := os.Stat(p); return err == nil }
 
-func run(name string, args ...string) error {
+// 跑外部命令；测试里换成替身，不真跑 systemctl、sing-box
+var run = func(name string, args ...string) error {
 	return exec.Command(name, args...).Run()
 }
 
-func runOut(name string, args ...string) (string, error) {
+var runOut = func(name string, args ...string) (string, error) {
 	b, err := exec.Command(name, args...).CombinedOutput()
 	return strings.TrimSpace(string(b)), err
 }

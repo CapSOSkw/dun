@@ -20,9 +20,6 @@ const (
 	svcBox      = "dun-sb"
 	svcWeb      = "dun"
 	rulePrefix  = "dun ws "
-	xrayBin     = baseDir + "/bin/xray"
-	xrayConf    = baseDir + "/xray.json"
-	cfdBin      = baseDir + "/bin/cloudflared"
 	argoToken   = baseDir + "/argo.token"
 	svcXray     = "dun-xray"
 	svcArgo     = "dun-argo"
@@ -34,6 +31,9 @@ var (
 	statePath = baseDir + "/state.json"
 	sbBin     = baseDir + "/bin/sing-box"
 	sbConf    = baseDir + "/sing-box.json"
+	xrayConf  = baseDir + "/xray.json"
+	xrayBin   = baseDir + "/bin/xray"
+	cfdBin    = baseDir + "/bin/cloudflared"
 )
 
 // dun upgrade 从这个仓库的 Release 拉新版本；发版时 workflow 会用 -X main.repo 注入当前仓库
